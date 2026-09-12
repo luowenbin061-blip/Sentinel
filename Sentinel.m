@@ -236,9 +236,9 @@ static int g_seltestPass = 0, g_selftestFail = 0;
 static BOOL g_guided = NO;   // 首次引导只做一次
 
 // 前置声明
-static void showMenu(void);
-static void showReport(NSString *msg);
-static void showSettings(void);
+static void panelShow(void);
+static void panelHide(void);
+static void panelRefreshStatus(void);
 static void showRegionSelector(void);
 static void probeOnce(void);
 static void startWatching(void);
@@ -522,12 +522,598 @@ static void probeOnce(void) {
     dispatch_async(g_queue, ^{
         @autoreleasepool { scanOnce(@"probe"); }
         dispatch_async(dispatch_get_main_queue(), ^{
-            showReport([NSString stringWithFormat:@"试测结果\n\n%@\n\n识别到的文字：\n%@",
-                        g_lastReport, joinShort(g_lastScanTexts ?: @[])]);
+            // 不用弹窗：把结果写进状态，再把面板（窗口页面）打开展示
+            if (!g_lastReport) g_lastReport = @"试测完成";
+            panelShow();
+            panelRefreshStatus();
+            showBanner(@"试测完成，结果见面板状态栏");
         });
     });
 }
 
+#pragma mark - 面板（仿老贝贝「设置弹窗」结构，纯 frame 布局）
+@class SELActions;   // 面板动作都派发到这个类
+// 结构照它的 ivar 1:1 还原：
+//   遮罩 → 面板(标题栏=标题标签+标题高光层CAGradientLayer+关闭按钮)
+//                    (内容滚动区 = 纵向排布的分区)
+//                    (底部视图 = 按钮栏)
+//   分区 = 字段标题 + 控件行 + 分割线
+// 它自己就是按 Y 坐标排的（方法名「添加XX设置区域起始Y:」），这里同样按 Y 排。
+
+static const CGFloat kPanelRadius = 20.0;
+static const CGFloat kPanelTitleH = 54.0;
+static const CGFloat kPanelFootH  = 66.0;
+static const CGFloat kPanelPadX   = 20.0;
+static const CGFloat kRowH        = 44.0;
+
+#define PANEL_BG      [UIColor colorWithRed:0.13 green:0.14 blue:0.16 alpha:0.96]
+#define PANEL_LINE    [UIColor colorWithWhite:1.0 alpha:0.10]
+#define PANEL_TEXT    [UIColor colorWithWhite:1.0 alpha:0.95]
+#define PANEL_DIM     [UIColor colorWithWhite:1.0 alpha:0.52]
+#define PANEL_FIELD   [UIColor colorWithWhite:1.0 alpha:0.08]
+#define PANEL_ACCENT  [UIColor colorWithRed:0.24 green:0.78 blue:0.52 alpha:1.0]
+
+static UIWindow *g_panelWin = nil;
+static UIView   *g_panelBox = nil;
+static UIScrollView *g_panelScroll = nil;
+static UILabel  *g_panelStatus = nil;
+static UILabel  *g_regionValue = nil, *g_kwValue = nil, *g_synValue = nil;
+static UILabel  *g_intervalVal = nil, *g_cooldownVal = nil;
+static UISegmentedControl *g_vibSeg = nil, *g_sndSeg = nil, *g_hookSeg = nil;
+static UIButton *g_runBtn = nil;
+static NSInteger g_sectionCount = 0;
+static CGFloat   g_panelW = 0;
+
+// 输入卡片（不用 UIAlertController）
+static UIWindow *g_promptWin = nil;
+static UIView   *g_promptCard = nil;
+static UITextField *g_promptField = nil;
+static void (^g_promptOK)(NSString *text) = nil;
+
+#pragma mark 控件工厂（按 Y 排布，不用 Auto Layout）
+
+static UILabel *mkLabel(NSString *text, CGFloat size, UIColor *color, BOOL bold) {
+    UILabel *l = [[UILabel alloc] init];
+    l.text = text;
+    l.font = bold ? [UIFont boldSystemFontOfSize:size] : [UIFont systemFontOfSize:size];
+    l.textColor = color;
+    l.numberOfLines = 0;
+    l.backgroundColor = [UIColor clearColor];
+    return l;
+}
+
+static UIView *mkRowValue(NSString *title, CGFloat w, UILabel **outVal) {
+    UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, kRowH)];
+    UILabel *l = mkLabel(title, 15, PANEL_TEXT, NO);
+    l.frame = CGRectMake(0, 0, w * 0.55, kRowH);
+    [row addSubview:l];
+
+    UILabel *v = mkLabel(@"—", 14, PANEL_DIM, NO);
+    v.textAlignment = NSTextAlignmentRight;
+    v.lineBreakMode = NSLineBreakByTruncatingHead;
+    v.frame = CGRectMake(w * 0.45, 0, w * 0.55 - 14, kRowH);
+    [row addSubview:v];
+    if (outVal) *outVal = v;
+
+    UIImageView *chev = [[UIImageView alloc] initWithFrame:CGRectMake(w - 9, (kRowH - 14) / 2.0, 9, 14)];
+    chev.image = [UIImage systemImageNamed:@"chevron.right"];
+    chev.tintColor = [UIColor colorWithWhite:1.0 alpha:0.28];
+    chev.contentMode = UIViewContentModeScaleAspectFit;
+    [row addSubview:chev];
+    return row;
+}
+
+static UIView *mkRowButtons(NSArray<NSString *> *titles, CGFloat w) {
+    UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, kRowH)];
+    CGFloat n = (CGFloat)titles.count;
+    CGFloat bw = (w - 8 * (n - 1)) / n;
+    for (NSUInteger i = 0; i < titles.count; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.frame = CGRectMake(i * (bw + 8), 0, bw, kRowH);
+        b.tag = 200 + (NSInteger)i;
+        b.backgroundColor = PANEL_FIELD;
+        b.layer.cornerRadius = 9;
+        b.layer.borderWidth = 0.5;
+        b.layer.borderColor = PANEL_LINE.CGColor;
+        [b setTitle:titles[i] forState:UIControlStateNormal];
+        [b setTitleColor:PANEL_TEXT forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont systemFontOfSize:15];
+        [row addSubview:b];
+    }
+    return row;
+}
+
+static UIView *mkRowSegmented(NSString *title, NSArray<NSString *> *items, NSInteger sel,
+                              CGFloat w, CGFloat segW, NSInteger tag) {
+    UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, kRowH)];
+    UILabel *l = mkLabel(title, 15, PANEL_TEXT, NO);
+    l.frame = CGRectMake(0, 0, w - segW - 12, kRowH);
+    [row addSubview:l];
+
+    UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:items];
+    seg.frame = CGRectMake(w - segW, (kRowH - 34) / 2.0, segW, 34);
+    seg.selectedSegmentIndex = sel;
+    seg.selectedSegmentTintColor = PANEL_ACCENT;
+    seg.tag = tag;
+    [seg setTitleTextAttributes:@{ NSForegroundColorAttributeName: PANEL_DIM,
+                                   NSFontAttributeName: [UIFont systemFontOfSize:14] }
+                       forState:UIControlStateNormal];
+    [seg setTitleTextAttributes:@{ NSForegroundColorAttributeName: [UIColor whiteColor],
+                                   NSFontAttributeName: [UIFont boldSystemFontOfSize:14] }
+                       forState:UIControlStateSelected];
+    [row addSubview:seg];
+    return row;
+}
+
+#pragma mark 面板内容
+
+static NSString *regionText(void) {
+    CGRect r;
+    if (!loadRegion(&r)) return @"未圈定";
+    return [NSString stringWithFormat:@"%.0f%%,%.0f%%  %.0f%%×%.0f%%",
+            r.origin.x * 100, r.origin.y * 100, r.size.width * 100, r.size.height * 100];
+}
+
+static CGFloat g_cursorY = 0;
+
+static void panelAdd(CGFloat topGap, UIView *v, CGFloat w) {
+    g_cursorY += topGap;
+    v.frame = CGRectMake(0, g_cursorY, w, v.frame.size.height);
+    [g_panelScroll addSubview:v];
+    g_cursorY += v.frame.size.height;
+}
+
+static void panelAddSectionTitle(NSString *t, CGFloat w) {
+    UILabel *l = mkLabel(t, 13, PANEL_DIM, NO);
+    l.frame = CGRectMake(0, 0, w, 20);
+    panelAdd(g_sectionCount ? 18 : 0, l, w);
+    g_cursorY += 4;
+    g_sectionCount++;
+}
+
+static void panelAddDivider(CGFloat w) {
+    UIView *d = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 1.0 / [UIScreen mainScreen].scale)];
+    d.backgroundColor = PANEL_LINE;
+    panelAdd(12, d, w);
+}
+
+static void panelBuild(void) {
+    for (UIView *v in [g_panelScroll.subviews copy]) [v removeFromSuperview];
+    g_cursorY = 16;
+    g_sectionCount = 0;
+    CGFloat w = g_panelW;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+
+    // ① 状态
+    panelAddSectionTitle(@"状态", w);
+    g_panelStatus = mkLabel(@"", 14, PANEL_TEXT, NO);
+    g_panelStatus.frame = CGRectMake(0, 0, w, 40);
+    panelAdd(0, g_panelStatus, w);
+    panelAddDivider(w);
+
+    // ② 监视区域
+    panelAddSectionTitle(@"监视区域", w);
+    UIView *r1 = mkRowValue(@"当前区域", w, &g_regionValue);
+    panelAdd(0, r1, w);
+    UIView *r2 = mkRowButtons(@[ @"圈定区域", @"整屏" ], w);
+    for (UIButton *b in r2.subviews)
+        [b addTarget:[SELActions class] action:@selector(onRegionBtn:)
+    forControlEvents:UIControlEventTouchUpInside];
+    panelAdd(6, r2, w);
+    panelAddDivider(w);
+
+    // ③ 关键词
+    panelAddSectionTitle(@"关键词", w);
+    UIView *r3 = mkRowValue(@"识别到就报警（逗号分隔）", w, &g_kwValue);
+    [r3 addGestureRecognizer:[[UITapGestureRecognizer alloc]
+        initWithTarget:[SELActions class] action:@selector(onKeywordsRow)]];
+    panelAdd(0, r3, w);
+    panelAddDivider(w);
+
+    // ④ 同义词
+    panelAddSectionTitle(@"同义词", w);
+    UIView *r4 = mkRowValue(@"= 连同义词，; 分组", w, &g_synValue);
+    [r4 addGestureRecognizer:[[UITapGestureRecognizer alloc]
+        initWithTarget:[SELActions class] action:@selector(onSynonymsRow)]];
+    panelAdd(0, r4, w);
+    panelAddDivider(w);
+
+    // ⑤ 节奏
+    panelAddSectionTitle(@"节奏", w);
+    UIView *r5 = mkRowValue(@"扫描间隔（秒）", w, &g_intervalVal);
+    [r5 addGestureRecognizer:[[UITapGestureRecognizer alloc]
+        initWithTarget:[SELActions class] action:@selector(onIntervalRow)]];
+    panelAdd(0, r5, w);
+    UIView *r6 = mkRowValue(@"报警冷却（秒）", w, &g_cooldownVal);
+    [r6 addGestureRecognizer:[[UITapGestureRecognizer alloc]
+        initWithTarget:[SELActions class] action:@selector(onCooldownRow)]];
+    panelAdd(0, r6, w);
+    panelAddDivider(w);
+
+    // ⑥ 报警方式
+    panelAddSectionTitle(@"报警方式", w);
+    UIView *r7 = mkRowSegmented(@"震动", @[ @"关", @"开" ],
+                                [ud boolForKey:@"sentinel_vibrate"] ? 1 : 0, w, 120, 400);
+    g_vibSeg = (UISegmentedControl *)[r7 viewWithTag:400];
+    [g_vibSeg addTarget:[SELActions class] action:@selector(onVibrateSeg:)
+       forControlEvents:UIControlEventValueChanged];
+    panelAdd(0, r7, w);
+    UIView *r8 = mkRowSegmented(@"声音（系统音）", @[ @"关", @"开" ],
+                                [ud boolForKey:@"sentinel_sound"] ? 1 : 0, w, 120, 401);
+    g_sndSeg = (UISegmentedControl *)[r8 viewWithTag:401];
+    [g_sndSeg addTarget:[SELActions class] action:@selector(onSoundSeg:)
+       forControlEvents:UIControlEventValueChanged];
+    panelAdd(0, r8, w);
+    panelAddDivider(w);
+
+    // ⑦ 与同进程其它插件共存
+    panelAddSectionTitle(@"共存", w);
+    UIView *r9 = mkRowSegmented(@"入口挂到老贝贝设置页", @[ @"不挂", @"挂上" ],
+                                [ud boolForKey:@"sentinel_hook_settings"] ? 1 : 0, w, 120, 402);
+    g_hookSeg = (UISegmentedControl *)[r9 viewWithTag:402];
+    [g_hookSeg addTarget:[SELActions class] action:@selector(onHookSeg:)
+        forControlEvents:UIControlEventValueChanged];
+    panelAdd(0, r9, w);
+    UILabel *note = mkLabel(@"打开后老贝贝设置页底部会多一项「屏幕哨兵」（需重开 App）。\n默认关闭——绝不改动老贝贝本身。", 12, PANEL_DIM, NO);
+    note.frame = CGRectMake(0, 0, w, 34);
+    panelAdd(4, note, w);
+
+    g_panelScroll.contentSize = CGSizeMake(w, g_cursorY + 18);
+    panelRefreshStatus();
+}
+
+static void panelRefreshStatus(void) {
+    if (!g_panelStatus) return;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    g_panelStatus.text = [NSString stringWithFormat:@"%@ · %@",
+        g_running ? @"监视中" : @"已暂停", g_lastReport ?: @"—"];
+    if (g_regionValue) g_regionValue.text = regionText();
+    if (g_kwValue)     g_kwValue.text = [g_keywords componentsJoinedByString:@","];
+    NSString *syn = [ud stringForKey:@"sentinel_synonyms"];
+    if (g_synValue)    g_synValue.text = syn.length ? syn : @"（未设置）";
+    if (g_intervalVal) g_intervalVal.text = [NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_interval", kIdleInterval)];
+    if (g_cooldownVal) g_cooldownVal.text = [NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_cooldown", kCooldownDefault)];
+    if (g_runBtn)      [g_runBtn setTitle:(g_running ? @"暂停监视" : @"开始监视") forState:UIControlStateNormal];
+}
+
+#pragma mark 面板显示 / 关闭
+
+static void panelHide(void) {
+    if (g_promptWin) { g_promptWin.hidden = YES; g_promptWin = nil; g_promptCard = nil; g_promptField = nil; g_promptOK = nil; }
+    if (!g_panelWin) return;
+    UIWindow *w = g_panelWin;
+    g_panelWin = nil; g_panelBox = nil; g_panelScroll = nil; g_panelStatus = nil;
+    g_regionValue = g_kwValue = g_synValue = g_intervalVal = g_cooldownVal = nil;
+    g_vibSeg = g_sndSeg = g_hookSeg = nil; g_runBtn = nil;
+    [UIView animateWithDuration:0.18 animations:^{ w.alpha = 0; }
+                     completion:^(BOOL f) { w.hidden = YES; SLog(@"panel closed"); }];
+}
+
+static void panelShow(void) {
+    if (g_panelWin) { panelRefreshStatus(); return; }
+    @try {
+        UIWindowScene *scene = nil;
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]] &&
+                s.activationState == UISceneActivationStateForegroundActive) {
+                scene = (UIWindowScene *)s; break;
+            }
+        }
+        if (!scene) { SLog(@"panel: no scene"); return; }
+        CGSize S = scene.screen.bounds.size;
+
+        UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
+        w.frame = CGRectMake(0, 0, S.width, S.height);
+        w.windowLevel = UIWindowLevelAlert + 100;
+        w.backgroundColor = [UIColor clearColor];
+        w.userInteractionEnabled = YES;
+        g_panelWin = w;
+
+        UIView *mask = [[UIView alloc] initWithFrame:w.bounds];
+        mask.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+        mask.userInteractionEnabled = YES;
+        [mask addGestureRecognizer:[[UITapGestureRecognizer alloc]
+            initWithTarget:[SELActions class] action:@selector(onMaskTap)]];
+        [w addSubview:mask];
+
+        CGFloat pw = MIN(S.width - 28, 420);
+        CGFloat ph = MIN(S.height * 0.80, 660);
+        g_panelW = pw - kPanelPadX * 2;
+        UIView *box = [[UIView alloc] initWithFrame:
+            CGRectMake((S.width - pw) / 2.0, (S.height - ph) / 2.0, pw, ph)];
+        box.backgroundColor = PANEL_BG;
+        box.layer.cornerRadius = kPanelRadius;
+        box.layer.borderWidth = 0.5;
+        box.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.14].CGColor;
+        box.clipsToBounds = YES;
+        [w addSubview:box];
+        g_panelBox = box;
+
+        // 标题栏 + 高光层（对应 _标题栏 / _标题标签 / _标题高光层）
+        UIView *titleBar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, kPanelTitleH)];
+        [box addSubview:titleBar];
+        CAGradientLayer *gl = [CAGradientLayer layer];
+        gl.frame = titleBar.bounds;
+        gl.colors = @[ (id)[UIColor colorWithWhite:1.0 alpha:0.13].CGColor,
+                       (id)[UIColor colorWithWhite:1.0 alpha:0.0].CGColor ];
+        gl.startPoint = CGPointMake(0.5, 0);
+        gl.endPoint = CGPointMake(0.5, 1);
+        [titleBar.layer addSublayer:gl];
+
+        UILabel *title = mkLabel(@"屏幕哨兵", 17, PANEL_TEXT, YES);
+        title.textAlignment = NSTextAlignmentCenter;
+        title.frame = CGRectMake(60, 0, pw - 120, kPanelTitleH);
+        [titleBar addSubview:title];
+
+        UIButton *close = [UIButton buttonWithType:UIButtonTypeCustom];
+        close.frame = CGRectMake(pw - 46, (kPanelTitleH - 34) / 2.0, 34, 34);
+        [close setImage:[UIImage systemImageNamed:@"xmark"] forState:UIControlStateNormal];
+        close.tintColor = PANEL_DIM;
+        [close addTarget:[SELActions class] action:@selector(onCloseBtn)
+        forControlEvents:UIControlEventTouchUpInside];
+        [titleBar addSubview:close];
+
+        UIView *tline = [[UIView alloc] initWithFrame:CGRectMake(0, kPanelTitleH - 0.5, pw, 0.5)];
+        tline.backgroundColor = PANEL_LINE;
+        [titleBar addSubview:tline];
+
+        // 内容滚动区（对应 _内容滚动区 + _内容栈）
+        UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(
+            kPanelPadX, kPanelTitleH, g_panelW, ph - kPanelTitleH - kPanelFootH)];
+        sv.showsVerticalScrollIndicator = YES;
+        sv.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+        [box addSubview:sv];
+        g_panelScroll = sv;
+
+        // 底部按钮栏（对应 _底部视图）
+        UIView *foot = [[UIView alloc] initWithFrame:CGRectMake(0, ph - kPanelFootH, pw, kPanelFootH)];
+        [box addSubview:foot];
+        UIView *fline = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, 0.5)];
+        fline.backgroundColor = PANEL_LINE;
+        [foot addSubview:fline];
+
+        NSArray *defs = @[ @[ @"开始监视", @"301" ], @[ @"试测一次", @"302" ], @[ @"复制日志", @"303" ] ];
+        CGFloat fw = (pw - kPanelPadX * 2 - 8 * 2) / 3.0;
+        for (NSUInteger i = 0; i < defs.count; i++) {
+            UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+            b.frame = CGRectMake(kPanelPadX + i * (fw + 8), (kPanelFootH - 40) / 2.0, fw, 40);
+            b.tag = [defs[i][1] integerValue];
+            b.backgroundColor = (i == 0) ? PANEL_ACCENT : PANEL_FIELD;
+            b.layer.cornerRadius = 9;
+            [b setTitle:defs[i][0] forState:UIControlStateNormal];
+            [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            b.titleLabel.font = [UIFont systemFontOfSize:14];
+            [b addTarget:[SELActions class] action:@selector(onFootBtn:)
+                forControlEvents:UIControlEventTouchUpInside];
+            if (i == 0) g_runBtn = b;
+            [foot addSubview:b];
+        }
+
+        panelBuild();
+
+        w.alpha = 0;
+        w.hidden = NO;   // 不 makeKeyAndVisible
+        [UIView animateWithDuration:0.2 animations:^{ w.alpha = 1; }];
+        SLog(@"panel shown: %.0fx%.0f, %ld 个分区, 内容高 %.0f",
+             pw, ph, (long)g_sectionCount, g_cursorY);
+    } @catch (NSException *e) {
+        SLog(@"panel exception: %@", e);
+    }
+}
+
+#pragma mark 面板内输入卡片（不使用 UIAlertController）
+
+static void panelPrompt(NSString *title, NSString *hint, NSString *current,
+                        void (^onOK)(NSString *text)) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            if (g_promptWin) { g_promptWin.hidden = YES; g_promptWin = nil; }
+            UIWindowScene *scene = nil;
+            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]] &&
+                    s.activationState == UISceneActivationStateForegroundActive) {
+                    scene = (UIWindowScene *)s; break;
+                }
+            }
+            if (!scene) return;
+            CGSize S = scene.screen.bounds.size;
+
+            UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
+            w.frame = CGRectMake(0, 0, S.width, S.height);
+            w.windowLevel = UIWindowLevelAlert + 101;
+            w.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+            w.userInteractionEnabled = YES;
+            g_promptWin = w;
+
+            UIView *tap = [[UIView alloc] initWithFrame:w.bounds];
+            [tap addGestureRecognizer:[[UITapGestureRecognizer alloc]
+                initWithTarget:[SELActions class] action:@selector(onPromptCancel)]];
+            [w addSubview:tap];
+
+            CGFloat cw = MIN(S.width - 56, 360);
+            CGFloat ch = 190;
+            UIView *card = [[UIView alloc] initWithFrame:
+                CGRectMake((S.width - cw) / 2.0, S.height * 0.16, cw, ch)];
+            card.backgroundColor = [UIColor colorWithRed:0.16 green:0.17 blue:0.19 alpha:1.0];
+            card.layer.cornerRadius = 14;
+            card.layer.borderWidth = 0.5;
+            card.layer.borderColor = PANEL_LINE.CGColor;
+            card.clipsToBounds = YES;
+            [w addSubview:card];
+            g_promptCard = card;
+
+            UILabel *t = mkLabel(title, 16, PANEL_TEXT, YES);
+            t.frame = CGRectMake(16, 16, cw - 32, 22);
+            [card addSubview:t];
+
+            UILabel *h = mkLabel(hint, 12, PANEL_DIM, NO);
+            h.frame = CGRectMake(16, 40, cw - 32, 16);
+            [card addSubview:h];
+
+            UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(16, 64, cw - 32, 42)];
+            tf.text = current ?: @"";
+            tf.textColor = PANEL_TEXT;
+            tf.font = [UIFont systemFontOfSize:15];
+            tf.backgroundColor = PANEL_FIELD;
+            tf.layer.cornerRadius = 8;
+            tf.layer.borderWidth = 0.5;
+            tf.layer.borderColor = PANEL_LINE.CGColor;
+            tf.autocorrectionType = UITextAutocorrectionTypeNo;
+            tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+            tf.clearButtonMode = UITextFieldViewModeAlways;
+            UIView *pad = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 42)];
+            tf.leftView = pad;
+            tf.leftViewMode = UITextFieldViewModeAlways;
+            [card addSubview:tf];
+            g_promptField = tf;
+
+            UIButton *cancel = [UIButton buttonWithType:UIButtonTypeCustom];
+            cancel.frame = CGRectMake(16, 120, (cw - 40) / 2.0, 42);
+            cancel.backgroundColor = PANEL_FIELD;
+            cancel.layer.cornerRadius = 9;
+            [cancel setTitle:@"取消" forState:UIControlStateNormal];
+            [cancel setTitleColor:PANEL_DIM forState:UIControlStateNormal];
+            [cancel addTarget:[SELActions class] action:@selector(onPromptCancel)
+             forControlEvents:UIControlEventTouchUpInside];
+            [card addSubview:cancel];
+
+            UIButton *ok = [UIButton buttonWithType:UIButtonTypeCustom];
+            ok.frame = CGRectMake(24 + (cw - 40) / 2.0, 120, (cw - 40) / 2.0, 42);
+            ok.backgroundColor = PANEL_ACCENT;
+            ok.layer.cornerRadius = 9;
+            [ok setTitle:@"确定" forState:UIControlStateNormal];
+            [ok setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            [ok addTarget:[SELActions class] action:@selector(onPromptOK)
+             forControlEvents:UIControlEventTouchUpInside];
+            [card addSubview:ok];
+
+            g_promptOK = onOK;
+            [tf becomeFirstResponder];
+            SLog(@"prompt shown: %@", title);
+        } @catch (NSException *e) { SLog(@"prompt exception: %@", e); }
+    });
+}
+
+#pragma mark 面板动作（全部由面板控件派发到这里）
+
+@interface SELActions : NSObject
+@end
+@implementation SELActions
+
++ (void)onMaskTap { panelHide(); }
++ (void)onCloseBtn { panelHide(); }
+
++ (void)onRegionBtn:(UIButton *)b {
+    BOOL full = (b.tag == 201);
+    panelHide();
+    if (full) {
+        saveRegion(CGRectMake(0, 0, 1, 1));
+        SLog(@"region set to full screen");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ probeOnce(); });
+    } else {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ showRegionSelector(); });
+    }
+}
+
++ (void)onKeywordsRow {
+    panelPrompt(@"关键词", @"多个用逗号分隔，例如：体力不足,无法操作",
+                [g_keywords componentsJoinedByString:@","], ^(NSString *text) {
+        [[NSUserDefaults standardUserDefaults] setObject:(text ?: @"") forKey:@"sentinel_keywords"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        refreshConfig();
+        SLog(@"keywords → %@", [g_keywords componentsJoinedByString:@"|"]);
+        panelRefreshStatus();
+    });
+}
+
++ (void)onSynonymsRow {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    panelPrompt(@"同义词", @"同义词用 = 连，不同组用 ; 隔。例：体力不足=体力不够;金币不足=金币不够",
+                [ud stringForKey:@"sentinel_synonyms"] ?: @"", ^(NSString *text) {
+        [[NSUserDefaults standardUserDefaults] setObject:(text ?: @"") forKey:@"sentinel_synonyms"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        refreshConfig();
+        SLog(@"synonyms → %@", text);
+        panelRefreshStatus();
+    });
+}
+
++ (void)onIntervalRow {
+    panelPrompt(@"扫描间隔", @"单位秒。越小越灵敏、越费电（建议 1~3）",
+        [NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_interval", kIdleInterval)], ^(NSString *text) {
+        double d = text.doubleValue;
+        if (d < 0.3) d = kIdleInterval;
+        [[NSUserDefaults standardUserDefaults] setObject:@(d) forKey:@"sentinel_interval"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        SLog(@"interval → %.1f", d);
+        panelRefreshStatus();
+    });
+}
+
++ (void)onCooldownRow {
+    panelPrompt(@"报警冷却", @"同一个关键词在这段时间内只报一次（单位秒）",
+        [NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_cooldown", kCooldownDefault)], ^(NSString *text) {
+        double d = text.doubleValue;
+        if (d < 1.0) d = kCooldownDefault;
+        [[NSUserDefaults standardUserDefaults] setObject:@(d) forKey:@"sentinel_cooldown"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        SLog(@"cooldown → %.1f", d);
+        panelRefreshStatus();
+    });
+}
+
++ (void)onVibrateSeg:(UISegmentedControl *)s {
+    [[NSUserDefaults standardUserDefaults] setBool:(s.selectedSegmentIndex == 1) forKey:@"sentinel_vibrate"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    SLog(@"vibrate → %d", (int)(s.selectedSegmentIndex == 1));
+}
+
++ (void)onSoundSeg:(UISegmentedControl *)s {
+    [[NSUserDefaults standardUserDefaults] setBool:(s.selectedSegmentIndex == 1) forKey:@"sentinel_sound"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    SLog(@"sound → %d", (int)(s.selectedSegmentIndex == 1));
+}
+
++ (void)onHookSeg:(UISegmentedControl *)s {
+    BOOL on = (s.selectedSegmentIndex == 1);
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"sentinel_hook_settings"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    SLog(@"hook settings page → %d（需重开 App；本次运行不生效）", (int)on);
+}
+
++ (void)onFootBtn:(UIButton *)b {
+    if (b.tag == 301) {
+        if (g_running) stopWatching(); else startWatching();
+        panelRefreshStatus();
+        return;
+    }
+    if (b.tag == 302) {
+        panelHide();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ probeOnce(); });
+        return;
+    }
+    if (b.tag == 303) {
+        NSString *log = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil];
+        [UIPasteboard generalPasteboard].string = log ?: @"(日志为空)";
+        showBanner(@"日志已复制到剪贴板");
+    }
+}
+
++ (void)onPromptCancel {
+    if (g_promptWin) { g_promptWin.hidden = YES; g_promptWin = nil; g_promptCard = nil; g_promptField = nil; g_promptOK = nil; }
+}
+
++ (void)onPromptOK {
+    NSString *text = g_promptField.text ?: @"";
+    void (^cb)(NSString *) = g_promptOK;
+    [SELActions onPromptCancel];
+    if (cb) cb(text);
+}
+
+@end
 #pragma mark - 悬浮球（左侧，避让右侧同类插件）
 
 @interface SELBallButton : UIButton
@@ -554,7 +1140,7 @@ static void probeOnce(void) {
 + (void)onDrag:(UIPanGestureRecognizer *)p;
 @end
 @implementation SELBallHelper
-+ (void)onTap:(UITapGestureRecognizer *)t { SLog(@"ball tap → menu"); showMenu(); }
++ (void)onTap:(UITapGestureRecognizer *)t { SLog(@"ball tap → panel"); panelShow(); }
 + (void)onDrag:(UIPanGestureRecognizer *)p {
     UIWindow *w = g_ballWin;
     if (!w) return;
@@ -622,145 +1208,6 @@ static void createFloatingBall(void) {
         g_ballWin = w;
         SLog(@"floating ball created at (%.0f, %.0f) [left side]", w.frame.origin.x, w.frame.origin.y);
     } @catch (NSException *e) { SLog(@"ball exception: %@", e); }
-}
-
-#pragma mark - 报告 / 设置 / 菜单
-
-static UIViewController *presentVC(void) {
-    UIWindow *win = nil;
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-        if (![s isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)s).windows) {
-            if (w == g_ballWin || w == g_bannerWin) continue;   // 跳过自己的窗口
-            if (w.hidden || !w.rootViewController) continue;
-            if (!win || w.windowLevel > win.windowLevel) win = w;
-        }
-    }
-    if (!win) return nil;
-    UIViewController *vc = win.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    return vc;
-}
-
-static void showReport(NSString *msg) {
-    SLog(@"report: %@", msg);
-    g_lastReport = msg;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            UIViewController *vc = presentVC();
-            if (!vc) return;
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"哨兵"
-                message:msg preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"确 定" style:UIAlertActionStyleCancel handler:nil]];
-            [vc presentViewController:ac animated:YES completion:nil];
-        } @catch (NSException *e) { SLog(@"report exception: %@", e); }
-    });
-}
-
-static void showSettings(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *vc = presentVC();
-        if (!vc) return;
-        CGRect r;
-        NSString *regionHint = loadRegion(&r)
-            ? [NSString stringWithFormat:@"当前区域 %.0f%%,%.0f%%  %.0f%%×%.0f%%",
-               r.origin.x*100, r.origin.y*100, r.size.width*100, r.size.height*100]
-            : @"还没圈定区域（点头 →「圈定监视区域」）";
-
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"哨兵设置"
-            message:[NSString stringWithFormat:
-                @"关键词：逗号分隔\n同义词：同义词用 = 连，不同组用 ; 隔\n例：体力不足=体力不够;金币不足=金币不够\n\n%@", regionHint]
-            preferredStyle:UIAlertControllerStyleAlert];
-
-        NSArray *specs = @[
-            @[@"sentinel_keywords", @"体力不足,无法操作",        @"关键词"],
-            @[@"sentinel_synonyms", @"体力不足=体力不够;金币不足=金币不够", @"同义词"],
-            @[@"sentinel_interval", @"2",                        @"扫描间隔(秒)"],
-            @[@"sentinel_cooldown", @"10",                       @"报警冷却(秒)"],
-        ];
-        for (NSArray *sp in specs) {
-            NSString *key = sp[0], *ph = sp[1], *title = sp[2];
-            [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-                id cur = [[NSUserDefaults standardUserDefaults] objectForKey:key];
-                tf.text = cur ? [NSString stringWithFormat:@"%@", cur] : @"";
-                tf.placeholder = [NSString stringWithFormat:@"%@：%@", title, ph];
-                tf.clearButtonMode = UITextFieldViewModeAlways;
-                BOOL isText = ([key isEqualToString:@"sentinel_keywords"] ||
-                               [key isEqualToString:@"sentinel_synonyms"]);
-                tf.keyboardType = isText ? UIKeyboardTypeDefault : UIKeyboardTypeDecimalPad;
-            }];
-        }
-        [ac addAction:[UIAlertAction actionWithTitle:@"保存并试测" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-            for (NSUInteger i = 0; i < specs.count; i++) {
-                NSString *key = specs[i][0];
-                NSString *val = ac.textFields[i].text ?: @"";
-                if ([key isEqualToString:@"sentinel_interval"] || [key isEqualToString:@"sentinel_cooldown"]) {
-                    double d = val.doubleValue;
-                    if (d <= 0) d = [key isEqualToString:@"sentinel_interval"] ? kIdleInterval : kCooldownDefault;
-                    [ud setObject:@(d) forKey:key];
-                } else {
-                    [ud setObject:val forKey:key];
-                }
-            }
-            [ud synchronize];
-            refreshConfig();
-            SLog(@"settings saved: kw=%@ iv=%.1f cd=%.1f",
-                 [g_keywords componentsJoinedByString:@"|"],
-                 cfgDouble(@"sentinel_interval", kIdleInterval),
-                 cfgDouble(@"sentinel_cooldown", kCooldownDefault));
-            probeOnce();
-        }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-        [vc presentViewController:ac animated:YES completion:nil];
-    });
-}
-
-static void showMenu(void) {
-    UIViewController *vc = presentVC();
-    if (!vc) { SLog(@"showMenu FAILED: no app window/rootVC"); return; }
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    BOOL vibrate = [ud boolForKey:@"sentinel_vibrate"];
-    BOOL sound   = [ud boolForKey:@"sentinel_sound"];
-    CGRect r; BOOL hasRegion = loadRegion(&r);
-
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"哨兵"
-        message:[NSString stringWithFormat:@"%@\n区域：%@\n关键词：%@\n%@",
-                 g_running ? @"监视中" : @"已暂停",
-                 hasRegion ? [NSString stringWithFormat:@"%.0f%%,%.0f%%  %.0f%%×%.0f%%",
-                              r.origin.x*100, r.origin.y*100, r.size.width*100, r.size.height*100] : @"未圈定",
-                 [g_keywords componentsJoinedByString:@" / "],
-                 g_lastReport]
-        preferredStyle:UIAlertControllerStyleActionSheet];
-    ac.popoverPresentationController.sourceView = vc.view;
-
-    [ac addAction:[UIAlertAction actionWithTitle:@"▭ 圈定监视区域" style:UIAlertActionStyleDefault
-        handler:^(UIAlertAction *a) { showRegionSelector(); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:(g_running ? @"⏸ 暂停监视" : @"▶ 开始监视")
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        if (g_running) stopWatching(); else startWatching();
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"🔍 试测一次（看识别到什么）" style:UIAlertActionStyleDefault
-        handler:^(UIAlertAction *a) { probeOnce(); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"⚙ 设置（关键词/同义词/间隔）" style:UIAlertActionStyleDefault
-        handler:^(UIAlertAction *a) { showSettings(); }]];
-    [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"📳 震动报警：%@", vibrate ? @"开" : @"关"]
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [ud setBool:!vibrate forKey:@"sentinel_vibrate"]; [ud synchronize];
-        SLog(@"vibrate → %d", (int)!vibrate);
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"🔊 声音报警：%@", sound ? @"开" : @"关"]
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [ud setBool:!sound forKey:@"sentinel_sound"]; [ud synchronize];
-        SLog(@"sound → %d", (int)!sound);
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"📋 复制日志" style:UIAlertActionStyleDefault
-        handler:^(UIAlertAction *a) {
-        NSString *log = [NSString stringWithContentsOfFile:g_logPath encoding:NSUTF8StringEncoding error:nil];
-        [UIPasteboard generalPasteboard].string = log ?: @"(日志为空)";
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-    [vc presentViewController:ac animated:YES completion:nil];
 }
 
 #pragma mark - 区域框选界面
@@ -1079,7 +1526,13 @@ static void runSelftest(void) {
     g_synonyms = loadSynonyms();
     ST_CHECK(g_keywords.count >= 1, @"config 关键词加载非空");
 
-    stWrite([NSString stringWithFormat:@"RESULT pass=%d fail=%d", g_seltestPass, g_selftestFail]);
+    // ⑩ 配置读写往返（面板「当前区域」那一行就是靠这个显示）
+    saveRegion(CGRectMake(0.1, 0.2, 0.3, 0.4));
+    CGRect rr;
+    ST_CHECK(loadRegion(&rr) && fabs(rr.origin.x - 0.1) < 0.001 && fabs(rr.size.height - 0.4) < 0.001,
+             @"config 区域存取往返正确");
+    ST_CHECK([regionText() rangeOfString:@"%"].location != NSNotFound, @"面板 区域摘要可生成");
+
     SLog(@"SELFTEST RESULT pass=%d fail=%d", g_seltestPass, g_selftestFail);
 
     NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -1087,8 +1540,11 @@ static void runSelftest(void) {
         [g_selftestLog writeToFile:[doc stringByAppendingPathComponent:@"Sentinel_selftest.txt"]
                         atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
-    showReport([NSString stringWithFormat:@"哨兵自测\n通过 %d · 失败 %d\n\n%@",
-                g_seltestPass, g_selftestFail, g_selftestLog]);
+    // 顺手验证面板能构建；CI 里会断言 "panel shown"
+    g_lastReport = [NSString stringWithFormat:@"自测 通过 %d · 失败 %d", g_seltestPass, g_selftestFail];
+    panelShow();
+    ST_CHECK(g_sectionCount >= 5, @"面板 分区数 >= 5（确认界面真的建起来了）");
+    stWrite([NSString stringWithFormat:@"RESULT pass=%d fail=%d", g_seltestPass, g_selftestFail]);
 }
 
 #pragma mark - 入口
