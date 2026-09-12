@@ -1,4 +1,4 @@
-# Sentinel · 屏幕哨兵（iOS 注入插件）
+# Sentinel · 屏幕哨兵 v1.1（iOS 注入插件）
 
 圈一块屏幕区域 → OCR 认出关键字 → 横幅 + 震动报警。
 配合 TrollFools 注入到任意 App 使用（未签名裸 dylib）。

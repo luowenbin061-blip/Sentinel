@@ -233,6 +233,7 @@ static UIWindow *g_ballWin = nil;
 static UIWindow *g_bannerWin = nil;
 static UILabel  *g_bannerLabel = nil;
 static int g_seltestPass = 0, g_selftestFail = 0;
+static BOOL g_guided = NO;   // 首次引导只做一次
 
 // 前置声明
 static void showMenu(void);
@@ -873,7 +874,9 @@ static void selDismiss(void) {
         saveRegion(n);
         SLog(@"region saved: %.4f,%.4f,%.4f,%.4f", n.origin.x, n.origin.y, n.size.width, n.size.height);
         selDismiss();
-        probeOnce();
+        // 等遮罩真的消失再试测，否则第一张图会拍到自己的遮罩层
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ probeOnce(); });
     }
 }
 @end
@@ -1122,8 +1125,18 @@ static void sentinel_init(void) {
         void (^onActive)(void) = ^{
             @try {
                 createFloatingBall();
-                if (g_selftest) runSelftest();
-                else            startWatching();
+                if (g_selftest) { runSelftest(); return; }
+                startWatching();
+                // 第一次用：还没圈过区域 → 先给提示，再自动把框选界面打开
+                if (!g_guided) {
+                    g_guided = YES;
+                    if (!loadRegion(NULL)) {
+                        SLog(@"first run: no region yet → opening selector");
+                        showBanner(@"哨兵已就绪：先圈定要盯住的区域");
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{ showRegionSelector(); });
+                    }
+                }
             } @catch (NSException *e) { SLog(@"onActive exception: %@", e); }
         };
 
