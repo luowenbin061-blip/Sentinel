@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile dylib (iphoneos, arm64)
+        run: |
+          set -e
+          SYSROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          BUILD_CMD=(
+            xcrun --sdk iphoneos clang -dynamiclib
+            -arch arm64
+            -miphoneos-version-min=15.0
+            -isysroot "$SYSROOT"
+            -fobjc-arc
+            -fvisibility=hidden
+            -O2
+            -Wall
+            -install_name @rpath/Sentinel.dylib
+            -o Sentinel.dylib Sentinel.m
+            -framework Foundation -framework UIKit -framework Vision
+            -framework CoreGraphics -framework QuartzCore -framework AudioToolbox
+          )
+          "${BUILD_CMD[@]}"
+          # 缺 LC_DYLD_CHAINED_FIXUPS 时 dyld 会静默拒绝加载
+          if ! otool -l Sentinel.dylib | grep -q LC_DYLD_CHAINED_FIXUPS; then
+            echo "chained fixups missing, relinking with -fixup_chains"
+            "${BUILD_CMD[@]}" -Wl,-fixup_chains
+            otool -l Sentinel.dylib | grep -q LC_DYLD_CHAINED_FIXUPS
+          fi
+          echo "--- verify ---"
+          otool -l Sentinel.dylib | grep -A2 LC_DYLD_CHAINED_FIXUPS
+          file Sentinel.dylib
+
+      - name: Pseudo-sign (ldid, empty entitlements)
+        run: |
+          brew install ldid
+          ldid -S Sentinel.dylib
+          ldid -e Sentinel.dylib || echo "(no entitlements embedded - OK for injected use)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sentinel-dylib
+          path: Sentinel.dylib
+          if-no-files-found: error
