@@ -523,13 +523,16 @@ static void probeOnce(void) {
         @autoreleasepool { scanOnce(@"probe"); }
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!g_lastReport) g_lastReport = @"试测完成";
-            panelShow();                 // 结果直接写进面板状态栏
+            panelShow();
             panelRefreshStatus();
         });
     });
 }
 
 #pragma mark - 面板（仿老贝贝「设置弹窗」结构，纯 frame 布局）
+// 面板所有控件的动作都派发到这里（必须先声明，控件工厂里要用 [SELActions class]）
+@interface SELActions : NSObject
+@end
 // 结构照它的 ivar 1:1 还原：
 //   遮罩 → 面板(标题栏=标题标签+标题高光层CAGradientLayer+关闭按钮)
 //                    (内容滚动区 = 纵向排布的分区)
@@ -1001,8 +1004,6 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
 }
 #pragma mark 面板动作（全部由面板控件派发到这里）
 
-@interface SELActions : NSObject
-@end
 @implementation SELActions
 
 + (void)onRegionRow {
@@ -1536,15 +1537,13 @@ static void runSelftest(void) {
     g_keywords = loadKeywords();
     g_synonyms = loadSynonyms();
     ST_CHECK(g_keywords.count >= 1, @"config 关键词加载非空");
-
-    // ⑩ 配置读写往返（面板「当前区域」那一行靠这个显示）
     saveRegion(CGRectMake(0.1, 0.2, 0.3, 0.4));
     CGRect rr;
     ST_CHECK(loadRegion(&rr) && fabs(rr.origin.x - 0.1) < 0.001 && fabs(rr.size.height - 0.4) < 0.001,
              @"config 区域存取往返正确");
     ST_CHECK([regionText() rangeOfString:@"%"].location != NSNotFound, @"面板 区域摘要可生成");
 
-    SLog(@"SELFTEST RESULT pass=%d fail=%d", g_seltestPass, g_selftestFail);
+    SLog(@"SELFTEST RESULT pass=%d fail=%d", g_selftestPass, g_selftestFail);
 
     NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     if (doc) {
@@ -1576,7 +1575,7 @@ static void sentinel_init(void) {
     if ([ud objectForKey:@"sentinel_cooldown"] == nil) [ud setObject:@(kCooldownDefault) forKey:@"sentinel_cooldown"];
     [ud synchronize];
 
-    SLog(@"constructor v2.1 (selftest=%d, keywords=%@)", (int)g_selftest,
+    SLog(@"constructor (selftest=%d, keywords=%@)", (int)g_selftest,
          [g_keywords componentsJoinedByString:@"|"]);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kStartupDelay * NSEC_PER_SEC)),
