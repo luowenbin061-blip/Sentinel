@@ -532,7 +532,8 @@ static void probeOnce(void) {
 }
 
 #pragma mark - 面板（仿老贝贝「设置弹窗」结构，纯 frame 布局）
-@class SELActions;   // 面板动作都派发到这个类
+@interface SELActions : NSObject   // 面板动作都派发到这里
+@end
 // 结构照它的 ivar 1:1 还原：
 //   遮罩 → 面板(标题栏=标题标签+标题高光层CAGradientLayer+关闭按钮)
 //                    (内容滚动区 = 纵向排布的分区)
@@ -582,7 +583,9 @@ static UILabel *mkLabel(NSString *text, CGFloat size, UIColor *color, BOOL bold)
     return l;
 }
 
-static UIView *mkRowValue(NSString *title, CGFloat w, UILabel **outVal) {
+#define kValueTag 501   // 值行里那个"当前值"label 的 tag
+
+static UIView *mkRowValue(NSString *title, CGFloat w) {
     UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, kRowH)];
     UILabel *l = mkLabel(title, 15, PANEL_TEXT, NO);
     l.frame = CGRectMake(0, 0, w * 0.55, kRowH);
@@ -592,8 +595,8 @@ static UIView *mkRowValue(NSString *title, CGFloat w, UILabel **outVal) {
     v.textAlignment = NSTextAlignmentRight;
     v.lineBreakMode = NSLineBreakByTruncatingHead;
     v.frame = CGRectMake(w * 0.45, 0, w * 0.55 - 14, kRowH);
+    v.tag = kValueTag;
     [row addSubview:v];
-    if (outVal) *outVal = v;
 
     UIImageView *chev = [[UIImageView alloc] initWithFrame:CGRectMake(w - 9, (kRowH - 14) / 2.0, 9, 14)];
     chev.image = [UIImage systemImageNamed:@"chevron.right"];
@@ -693,7 +696,8 @@ static void panelBuild(void) {
 
     // ② 监视区域
     panelAddSectionTitle(@"监视区域", w);
-    UIView *r1 = mkRowValue(@"当前区域", w, &g_regionValue);
+    UIView *r1 = mkRowValue(@"当前区域", w);
+    g_regionValue = (UILabel *)[r1 viewWithTag:kValueTag];
     panelAdd(0, r1, w);
     UIView *r2 = mkRowButtons(@[ @"圈定区域", @"整屏" ], w);
     for (UIButton *b in r2.subviews)
@@ -704,7 +708,8 @@ static void panelBuild(void) {
 
     // ③ 关键词
     panelAddSectionTitle(@"关键词", w);
-    UIView *r3 = mkRowValue(@"识别到就报警（逗号分隔）", w, &g_kwValue);
+    UIView *r3 = mkRowValue(@"识别到就报警（逗号分隔）", w);
+    g_kwValue = (UILabel *)[r3 viewWithTag:kValueTag];
     [r3 addGestureRecognizer:[[UITapGestureRecognizer alloc]
         initWithTarget:[SELActions class] action:@selector(onKeywordsRow)]];
     panelAdd(0, r3, w);
@@ -712,7 +717,8 @@ static void panelBuild(void) {
 
     // ④ 同义词
     panelAddSectionTitle(@"同义词", w);
-    UIView *r4 = mkRowValue(@"= 连同义词，; 分组", w, &g_synValue);
+    UIView *r4 = mkRowValue(@"= 连同义词，; 分组", w);
+    g_synValue = (UILabel *)[r4 viewWithTag:kValueTag];
     [r4 addGestureRecognizer:[[UITapGestureRecognizer alloc]
         initWithTarget:[SELActions class] action:@selector(onSynonymsRow)]];
     panelAdd(0, r4, w);
@@ -720,11 +726,13 @@ static void panelBuild(void) {
 
     // ⑤ 节奏
     panelAddSectionTitle(@"节奏", w);
-    UIView *r5 = mkRowValue(@"扫描间隔（秒）", w, &g_intervalVal);
+    UIView *r5 = mkRowValue(@"扫描间隔（秒）", w);
+    g_intervalVal = (UILabel *)[r5 viewWithTag:kValueTag];
     [r5 addGestureRecognizer:[[UITapGestureRecognizer alloc]
         initWithTarget:[SELActions class] action:@selector(onIntervalRow)]];
     panelAdd(0, r5, w);
-    UIView *r6 = mkRowValue(@"报警冷却（秒）", w, &g_cooldownVal);
+    UIView *r6 = mkRowValue(@"报警冷却（秒）", w);
+    g_cooldownVal = (UILabel *)[r6 viewWithTag:kValueTag];
     [r6 addGestureRecognizer:[[UITapGestureRecognizer alloc]
         initWithTarget:[SELActions class] action:@selector(onCooldownRow)]];
     panelAdd(0, r6, w);
@@ -996,8 +1004,6 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
 
 #pragma mark 面板动作（全部由面板控件派发到这里）
 
-@interface SELActions : NSObject
-@end
 @implementation SELActions
 
 + (void)onMaskTap { panelHide(); }
