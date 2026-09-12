@@ -1543,7 +1543,7 @@ static void runSelftest(void) {
              @"config 区域存取往返正确");
     ST_CHECK([regionText() rangeOfString:@"%"].location != NSNotFound, @"面板 区域摘要可生成");
 
-    SLog(@"SELFTEST RESULT pass=%d fail=%d", g_selftestPass, g_selftestFail);
+    SLog(@"SELFTEST RESULT pass=%d fail=%d", g_seltestPass, g_selftestFail);
 
     NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     if (doc) {
