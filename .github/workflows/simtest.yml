@@ -65,7 +65,7 @@ jobs:
       - name: Verdict
         run: |
           PASS=1
-          for m in "armed (sentinel v2" "floating ball created" "selftest begin" "panel shown" "alert card shown" "prompt shown" "timing(" "[probe] 安装完成"; do
+          for m in "armed (sentinel v2" "floating ball created" "selftest begin" "panel shown" "alert card shown" "prompt shown" "timing(" "\[probe\] 安装完成"; do
             if grep -q "$m" sentinel.log; then echo "PASS: $m"; else echo "FAIL: $m"; PASS=0; fi
           done
           # 注意：grep -c 命中 0 条时退出码是 1，不能再 || echo 0，否则会多出一行导致整数比较失败
