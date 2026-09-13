@@ -1702,6 +1702,42 @@ static void runSelftest(void) {
              @"config 区域存取往返正确");
     ST_CHECK([regionText() rangeOfString:@"%"].location != NSNotFound, @"面板 区域摘要可生成");
 
+    // ⑩ v2.2 修复项回归（这三处都是真机报上来的 bug，逻辑层必须自动验一遍）
+    // ① 面板可点行必须是 UIButton —— 原来挂 UITapGestureRecognizer，真机上点了完全没反应
+    panelShow();   // 幂等：确保面板已构建
+    __block int rowBtnN = 0;
+    for (UIView *v in g_panelScroll.subviews) if ([v isKindOfClass:[UIButton class]]) rowBtnN++;
+    ST_CHECK(rowBtnN >= 4, @"v2.2 面板可点行是 UIButton（不是手势）");
+
+    // ② 保存整屏后打开框选，初始框必须自动内缩 —— 否则整屏框铺满屏拖哪儿都卡死、四角手柄又贴屏幕边够不着
+    saveRegion(CGRectMake(0, 0, 1, 1));
+    selDismiss();
+    showRegionSelector();
+    BOOL selOK = (g_selWin != nil);
+    CGRect initRect = g_selRect;
+    CGFloat SW = g_selWin ? g_selWin.bounds.size.width : 390;
+    CGFloat SH = g_selWin ? g_selWin.bounds.size.height : 844;
+    ST_CHECK(selOK, @"v2.2 整屏后仍能重新打开框选界面");
+    ST_CHECK(selOK && initRect.size.width < SW * 0.95 && initRect.size.height < SH * 0.95,
+             @"v2.2 整屏区域打开框选时自动内缩（能拖小）");
+    selDismiss();
+
+    // ③ 状态行精简：只说在不在监控；命中才把关键词缀上
+    g_running = YES;
+    g_lastHitKeyword = nil;
+    panelRefreshStatus();
+    BOOL stIdle = [g_panelStatus.text isEqualToString:@"监视中"];
+    g_lastHitKeyword = @"福利";
+    panelRefreshStatus();
+    BOOL stHit = [g_panelStatus.text isEqualToString:@"监视中 · 「福利」"];
+    ST_CHECK(stIdle, @"v2.2 状态行只显示「监视中」");
+    ST_CHECK(stHit, @"v2.2 命中后状态行追加关键词");
+    g_running = NO;
+    g_lastHitKeyword = nil;
+
+    // ④ 报警卡片：异步建窗，靠日志断言（simtest Verdict 里 grep "alert card shown"）
+    fireAlert(@"福利", @"福利 点击领取");
+
     SLog(@"SELFTEST RESULT pass=%d fail=%d", g_seltestPass, g_selftestFail);
 
     NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
