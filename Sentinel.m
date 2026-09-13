@@ -41,6 +41,18 @@ static const double kSelftestBandH          = 0.14;
 
 static NSString *const kPeerBusyNote = @"com.changqing.fullTaskExecution";
 
+// 面板配色（v2.2：上移到文件前部 —— 报警卡片在面板工厂之前定义，要用这几个宏）
+#define PANEL_BG      [UIColor colorWithRed:0.173 green:0.173 blue:0.180 alpha:0.95]  // #2C2C2E
+#define PANEL_FIELD   [UIColor colorWithRed:0.227 green:0.227 blue:0.235 alpha:1.0]   // #3A3A3C 输入框/按钮
+#define PANEL_TROUGH  [UIColor colorWithRed:0.110 green:0.110 blue:0.118 alpha:1.0]   // #1C1C1E 分段控件底
+#define PANEL_TEXT    [UIColor whiteColor]
+#define PANEL_DIM     [UIColor colorWithWhite:1.0 alpha:0.62]   // 字段标题
+#define PANEL_HAIR    [UIColor colorWithWhite:1.0 alpha:0.07]   // 极淡分隔
+
+// 报警卡片要用到的控件工厂（实现在后面的面板区）
+static UILabel *mkLabel(NSString *text, CGFloat size, UIColor *color, BOOL bold);
+static UIButton *mkFootButton(NSString *title, BOOL primary, NSInteger tag);
+
 #pragma mark - 配置（sentinel_ 前缀）
 
 static NSArray<NSString *> *splitList(NSString *s, NSString *sep) {
@@ -228,6 +240,7 @@ static NSArray<NSArray<NSString *> *> *g_synonyms = nil;
 static NSMutableDictionary *g_lastAlert = nil;
 static NSMutableDictionary *g_hitStreak = nil;
 static NSString *g_lastReport = @"(还没有记录)";
+static NSString *g_lastHitKeyword = nil;   // v2.2：最近命中的关键词（只用来精简显示状态行）
 static NSArray<NSString *> *g_lastScanTexts = nil;
 static UIWindow *g_ballWin = nil;
 static UIWindow *g_bannerWin = nil;
@@ -381,13 +394,18 @@ static void showBanner(NSString *text) {
                 g_bannerWin = w;
             }
             // 关键：窗口 frame 只占横幅，不铺满屏（铺满会吞掉全屏触摸）
-            g_bannerWin.frame = CGRectMake(0, -h, scr.width, h);
+            // v2.2：从安全区下方开始 —— 原来从 y=0 起步，整条被 iOS 系统状态栏压住，所以"看不到内容"
+            CGFloat sbH = 44;
+            if (@available(iOS 13.0, *)) sbH = scene.statusBarManager.statusBarFrame.size.height;
+            if (sbH < 20) sbH = 44;
+            CGFloat y = sbH + 6;
+            g_bannerWin.frame = CGRectMake(0, y - h, scr.width, h);
             g_bannerLabel.frame = g_bannerWin.bounds;
             g_bannerLabel.text = text;
             g_bannerWin.hidden = NO;
 
             [UIView animateWithDuration:0.22 animations:^{
-                g_bannerWin.frame = CGRectMake(0, 0, scr.width, h);
+                g_bannerWin.frame = CGRectMake(0, y, scr.width, h);
             }];
 
             static int gen = 0;
@@ -396,7 +414,7 @@ static void showBanner(NSString *text) {
                            dispatch_get_main_queue(), ^{
                 if (my != gen || !g_bannerWin) return;
                 [UIView animateWithDuration:0.25 animations:^{
-                    g_bannerWin.frame = CGRectMake(0, -h, scr.width, h);
+                    g_bannerWin.frame = CGRectMake(0, y - h, scr.width, h);
                 } completion:^(BOOL f) {
                     if (my == gen && g_bannerWin) g_bannerWin.hidden = YES;
                 }];
@@ -405,14 +423,141 @@ static void showBanner(NSString *text) {
     });
 }
 
+// ===== v2.2 新增：报警卡片 =====
+// 顶部窄条只有 46pt 高、又被系统状态栏压住，真机上"内容完全看不到" →
+// 报警时额外弹一张卡片，把命中的关键词 + 识别到的原文完整摊开。
+// 卡片窗口只包住卡片本身（不铺满屏），所以不会挡住下面的操作；8 秒后自动收，也能点"知道了"提前收。
+static UIWindow *g_alertCardWin = nil;
+static int g_alertCardGen = 0;
+
+static void dismissAlertCard(void) {
+    if (!g_alertCardWin) return;
+    UIWindow *w = g_alertCardWin;
+    g_alertCardWin = nil;
+    g_alertCardGen++;
+    [UIView animateWithDuration:0.2 animations:^{ w.alpha = 0; }
+                     completion:^(BOOL f) { w.hidden = YES; }];
+}
+
+@interface SELAlertActions : NSObject
+@end
+@implementation SELAlertActions
++ (void)onDismiss:(id)sender { dismissAlertCard(); }
+@end
+
+static void showAlertCard(NSString *keyword, NSString *rawText) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      @try {
+        dismissAlertCard();   // 先收掉上一张
+        UIWindowScene *scene = nil;
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]] &&
+                s.activationState == UISceneActivationStateForegroundActive) {
+                scene = (UIWindowScene *)s; break;
+            }
+        }
+        if (!scene) return;
+        CGSize S = scene.screen.bounds.size;
+        CGFloat top = 44;
+        if (@available(iOS 13.0, *)) top = scene.statusBarManager.statusBarFrame.size.height;
+        if (top < 20) top = 44;
+
+        CGFloat cw = round(S.width * 0.84);
+        CGFloat padX = 16;
+        CGFloat innerW = cw - padX * 2;
+
+        NSString *raw = rawText.length ? rawText : @"（这一轮没识别到可读文字）";
+        UIFont *rawFont = [UIFont systemFontOfSize:14];
+        CGRect rawRect = [raw boundingRectWithSize:CGSizeMake(innerW, 999)
+                                          options:NSStringDrawingUsesLineFragmentOrigin
+                                       attributes:@{ NSFontAttributeName: rawFont } context:nil];
+        CGFloat rawH = MIN(ceil(rawRect.size.height), ceil(rawFont.lineHeight * 4));   // 最多 4 行
+
+        CGFloat h = 4 + 12 + 22 + 8 + 26 + 10 + 16 + rawH + 10 + 16 + 12 + 44 + 16;
+        CGFloat x = (S.width - cw) / 2.0;
+        CGFloat y = top + 52;
+        if (y + h > S.height - 40) y = MAX(top + 16, S.height - 40 - h);
+
+        UIWindow *w = [[UIWindow alloc] initWithWindowScene:scene];
+        w.frame = CGRectMake(x - 6, y - 6, cw + 12, h + 12);   // 只包住卡片，不吞全屏触摸
+        w.windowLevel = UIWindowLevelAlert + 98;
+        w.backgroundColor = [UIColor clearColor];
+        w.userInteractionEnabled = YES;
+        w.alpha = 0;
+        g_alertCardWin = w;
+        g_alertCardGen++;
+        int my = g_alertCardGen;
+
+        UIView *card = [[UIView alloc] initWithFrame:CGRectMake(6, 6, cw, h)];
+        card.backgroundColor = PANEL_BG;
+        card.layer.cornerRadius = 16;
+        card.clipsToBounds = YES;
+        [w addSubview:card];
+
+        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, cw, 4)];
+        bar.backgroundColor = [UIColor colorWithRed:1.0 green:0.27 blue:0.23 alpha:1.0];
+        [card addSubview:bar];
+
+        CGFloat cy = 16;
+        UILabel *t = mkLabel(@"🚨 哨兵报警", 16, PANEL_TEXT, YES);
+        t.frame = CGRectMake(padX, cy, innerW, 22);
+        [card addSubview:t];
+        cy += 30;
+
+        UILabel *k = mkLabel([NSString stringWithFormat:@"命中「%@」", keyword.length ? keyword : @"?"], 20,
+                             [UIColor colorWithRed:1.0 green:0.38 blue:0.32 alpha:1.0], YES);
+        k.frame = CGRectMake(padX, cy, innerW, 26);
+        [card addSubview:k];
+        cy += 36;
+
+        UILabel *sub = mkLabel(@"识别到的文字", 12, PANEL_DIM, NO);
+        sub.frame = CGRectMake(padX, cy, innerW, 16);
+        [card addSubview:sub];
+        cy += 18;
+
+        UILabel *rawL = mkLabel(raw, 14, PANEL_TEXT, NO);
+        rawL.font = rawFont;
+        rawL.numberOfLines = 4;
+        rawL.lineBreakMode = NSLineBreakByTruncatingTail;
+        rawL.frame = CGRectMake(padX, cy, innerW, rawH);
+        [card addSubview:rawL];
+        cy += rawH + 10;
+
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"HH:mm:ss";
+        UILabel *ts = mkLabel([NSString stringWithFormat:@"%@ 报警", [df stringFromDate:[NSDate date]]],
+                              11, PANEL_DIM, NO);
+        ts.frame = CGRectMake(padX, cy, innerW, 16);
+        [card addSubview:ts];
+
+        UIButton *ok = mkFootButton(@"知道了", YES, 0);
+        ok.frame = CGRectMake(padX, h - 16 - 44, innerW, 44);
+        [ok removeTarget:nil action:nil forControlEvents:UIControlEventAllEvents];
+        [ok addTarget:[SELAlertActions class] action:@selector(onDismiss:)
+     forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:ok];
+
+        w.hidden = NO;
+        [UIView animateWithDuration:0.2 animations:^{ w.alpha = 1; }];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (my == g_alertCardGen) dismissAlertCard();
+        });
+        SLog(@"alert card shown: keyword='%@' rawLen=%lu", keyword, (unsigned long)rawText.length);
+      } @catch (NSException *e) { SLog(@"alert card exception: %@", e); }
+    });
+}
+
 static void fireAlert(NSString *keyword, NSString *rawText) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     BOOL vibrate = [ud boolForKey:@"sentinel_vibrate"];
     BOOL sound   = [ud boolForKey:@"sentinel_sound"];
     if (vibrate) AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
-    if (sound)   AudioServicesPlaySystemSound(1007);   // 系统音，不建 AVAudioSession
-    showBanner([NSString stringWithFormat:@"哨兵｜命中「%@」%@", keyword,
-                rawText.length ? [NSString stringWithFormat:@"  %@", rawText] : @""]);
+    if (sound)   AudioServicesPlaySystemSound(1007);
+    g_lastHitKeyword = keyword;   // 状态行只显示这个关键词，别把整段识别原文塞进去
+    showBanner([NSString stringWithFormat:@"哨兵｜命中「%@」", keyword]);
+    showAlertCard(keyword, rawText);   // 完整内容看卡片
     SLog(@"ALERT keyword='%@' raw='%@' vibrate=%d sound=%d", keyword, rawText, (int)vibrate, (int)sound);
 }
 
@@ -550,12 +695,7 @@ static const CGFloat kGapSection  = 18.0;   // 上一控件 → 下个字段标�
 static const CGFloat kSegH        = 36.0;
 static const CGFloat kPanelWidthRatio = 0.66;  // 面板宽 = 屏宽 × 0.66（截图量出来的）
 
-#define PANEL_BG      [UIColor colorWithRed:0.173 green:0.173 blue:0.180 alpha:0.95]  // #2C2C2E
-#define PANEL_FIELD   [UIColor colorWithRed:0.227 green:0.227 blue:0.235 alpha:1.0]   // #3A3A3C 输入框/按钮
-#define PANEL_TROUGH  [UIColor colorWithRed:0.110 green:0.110 blue:0.118 alpha:1.0]   // #1C1C1E 分段控件底
-#define PANEL_TEXT    [UIColor whiteColor]
-#define PANEL_DIM     [UIColor colorWithWhite:1.0 alpha:0.62]   // 字段标题
-#define PANEL_HAIR    [UIColor colorWithWhite:1.0 alpha:0.07]   // 极淡分隔
+// 面板配色宏已上移到文件前部（kPeerBusyNote 之后）——报警卡片先于面板工厂定义，要用它们
 
 static UIWindow *g_panelWin = nil;
 static UIView   *g_panelBox = nil;
@@ -611,23 +751,32 @@ static UILabel *mkSectionTitle(NSString *t, CGFloat w) {
 }
 
 // 输入框样式的行（截图里"执行次数 → 1"那种深灰圆角框）
-static UIView *mkRowField(NSString *value, CGFloat w) {
-    UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, kRowH)];
+// v2.2：点击改由 UIButton 承载 —— 面板里 UITapGestureRecognizer 挂在这些行上真机不触发，
+// 而同一面板里所有 UIButton（开始监视/整屏监视/试测一次）都正常，所以统一用 UIButton。
+static UIButton *mkRowField(NSString *value, CGFloat w, SEL action) {
+    UIButton *row = [UIButton buttonWithType:UIButtonTypeCustom];
+    row.frame = CGRectMake(0, 0, w, kRowH);
     row.backgroundColor = PANEL_FIELD;
     row.layer.cornerRadius = 10;
-    row.userInteractionEnabled = YES;
+    row.exclusiveTouch = NO;
+    [row addTarget:[SELActions class] action:action forControlEvents:UIControlEventTouchUpInside];
 
     UILabel *v = mkLabel(value, 15, PANEL_TEXT, NO);
     v.frame = CGRectMake(14, 0, w - 14 - 32, kRowH);
     v.lineBreakMode = NSLineBreakByTruncatingHead;
     v.tag = kValueTag;
+    v.userInteractionEnabled = NO;   // 别让子视图吃掉点击
     [row addSubview:v];
 
     UIImageView *chev = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
     chev.tintColor = [UIColor colorWithWhite:1.0 alpha:0.30];
     chev.contentMode = UIViewContentModeScaleAspectFit;
     chev.frame = CGRectMake(w - 22, (kRowH - 13) / 2.0, 8, 13);
+    chev.userInteractionEnabled = NO;
     [row addSubview:chev];
+
+    // 点一下给个视觉反馈，方便判断"到底点没点到"
+    row.showsTouchWhenHighlighted = NO;
     return row;
 }
 
@@ -716,45 +865,37 @@ static void panelBuild(void) {
     g_panelStatus.frame = CGRectMake(0, 0, w, 38);
     panelAdd(0, g_panelStatus, w);
 
-    // ② 监视区域
+    // ② 监视区域（点这行 = 重新框选）
     panelAddSectionTitle(@"监视区域", w);
-    UIView *r1 = mkRowField(regionText(), w);
+    UIButton *r1 = mkRowField(regionText(), w, @selector(onRegionRow:));
     g_regionValue = (UILabel *)[r1 viewWithTag:kValueTag];
-    [r1 addGestureRecognizer:[[UITapGestureRecognizer alloc]
-        initWithTarget:[SELActions class] action:@selector(onRegionRow)]];
     panelAdd(0, r1, w);
     UIView *r1b = mkRowButton(@"整屏监视", w, 201);
     panelAdd(8, r1b, w);
 
     // ③ 关键词
     panelAddSectionTitle(@"关键词", w);
-    UIView *r3 = mkRowField([g_keywords componentsJoinedByString:@","], w);
+    UIButton *r3 = mkRowField([g_keywords componentsJoinedByString:@","], w, @selector(onKeywordsRow:));
     g_kwValue = (UILabel *)[r3 viewWithTag:kValueTag];
-    [r3 addGestureRecognizer:[[UITapGestureRecognizer alloc]
-        initWithTarget:[SELActions class] action:@selector(onKeywordsRow)]];
     panelAdd(0, r3, w);
 
     // ④ 同义词
     panelAddSectionTitle(@"同义词", w);
     NSString *syn = [ud stringForKey:@"sentinel_synonyms"];
-    UIView *r4 = mkRowField(syn.length ? syn : @"点击设置", w);
+    UIButton *r4 = mkRowField(syn.length ? syn : @"点击设置", w, @selector(onSynonymsRow:));
     g_synValue = (UILabel *)[r4 viewWithTag:kValueTag];
-    [r4 addGestureRecognizer:[[UITapGestureRecognizer alloc]
-        initWithTarget:[SELActions class] action:@selector(onSynonymsRow)]];
     panelAdd(0, r4, w);
 
     // ⑤ 节奏
     panelAddSectionTitle(@"扫描间隔（秒）", w);
-    UIView *r5 = mkRowField([NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_interval", kIdleInterval)], w);
+    UIButton *r5 = mkRowField([NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_interval", kIdleInterval)],
+                              w, @selector(onIntervalRow:));
     g_intervalVal = (UILabel *)[r5 viewWithTag:kValueTag];
-    [r5 addGestureRecognizer:[[UITapGestureRecognizer alloc]
-        initWithTarget:[SELActions class] action:@selector(onIntervalRow)]];
     panelAdd(0, r5, w);
     panelAddSectionTitle(@"报警冷却（秒）", w);
-    UIView *r6 = mkRowField([NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_cooldown", kCooldownDefault)], w);
+    UIButton *r6 = mkRowField([NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_cooldown", kCooldownDefault)],
+                              w, @selector(onCooldownRow:));
     g_cooldownVal = (UILabel *)[r6 viewWithTag:kValueTag];
-    [r6 addGestureRecognizer:[[UITapGestureRecognizer alloc]
-        initWithTarget:[SELActions class] action:@selector(onCooldownRow)]];
     panelAdd(0, r6, w);
 
     // ⑥ 报警方式
@@ -786,8 +927,11 @@ static void panelBuild(void) {
 static void panelRefreshStatus(void) {
     if (!g_panelStatus) return;
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    g_panelStatus.text = [NSString stringWithFormat:@"%@ · %@",
-        g_running ? @"监视中" : @"已暂停", g_lastReport ?: @"—"];
+    // v2.2：状态行只说"在不在监控"；命中了才把关键词缀在后面。
+    // （原来把整段识别原文拼进来，真机上被截成一团，完全看不清）
+    NSString *st = g_running ? @"监视中" : @"已暂停";
+    if (g_lastHitKeyword.length) st = [st stringByAppendingFormat:@" · 「%@」", g_lastHitKeyword];
+    g_panelStatus.text = st;
     if (g_regionValue) g_regionValue.text = regionText();
     if (g_kwValue)     g_kwValue.text = [g_keywords componentsJoinedByString:@","];
     NSString *syn = [ud stringForKey:@"sentinel_synonyms"];
@@ -831,11 +975,11 @@ static void panelShow(void) {
         g_panelWin = w;
 
         // 遮罩：比截图略深一点，保证底下的内容看不清（截图里遮罩很淡）
-        UIView *mask = [[UIView alloc] initWithFrame:w.bounds];
+        // v2.2：用 UIControl 承载点按（同面板按钮机制，避免手势在悬浮窗里不触发）
+        UIControl *mask = [[UIControl alloc] initWithFrame:w.bounds];
         mask.backgroundColor = [UIColor colorWithWhite:0 alpha:0.28];
-        mask.userInteractionEnabled = YES;
-        [mask addGestureRecognizer:[[UITapGestureRecognizer alloc]
-            initWithTarget:[SELActions class] action:@selector(onMaskTap)]];
+        [mask addTarget:[SELActions class] action:@selector(onMaskTap:)
+       forControlEvents:UIControlEventTouchUpInside];
         [w addSubview:mask];
 
         // 面板宽 = 屏宽 × 0.66（截图量出来的），高度先给最大值，建完内容再收
@@ -1006,13 +1150,14 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
 
 @implementation SELActions
 
-+ (void)onRegionRow {
++ (void)onRegionRow:(id)sender {
+    SLog(@"tap: 监视区域 → 重新框选");
     panelHide();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ showRegionSelector(); });
 }
 
-+ (void)onMaskTap { panelHide(); }
++ (void)onMaskTap:(id)sender { panelHide(); }
 + (void)onCloseBtn { panelHide(); }
 
 + (void)onRegionBtn:(UIButton *)b {
@@ -1029,7 +1174,8 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
     }
 }
 
-+ (void)onKeywordsRow {
++ (void)onKeywordsRow:(id)sender {
+    SLog(@"tap: 关键词 → 输入卡片");
     panelPrompt(@"关键词", @"多个用逗号分隔，例如：体力不足,无法操作",
                 [g_keywords componentsJoinedByString:@","], ^(NSString *text) {
         [[NSUserDefaults standardUserDefaults] setObject:(text ?: @"") forKey:@"sentinel_keywords"];
@@ -1040,7 +1186,8 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
     });
 }
 
-+ (void)onSynonymsRow {
++ (void)onSynonymsRow:(id)sender {
+    SLog(@"tap: 同义词 → 输入卡片");
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     panelPrompt(@"同义词", @"同义词用 = 连，不同组用 ; 隔。例：体力不足=体力不够;金币不足=金币不够",
                 [ud stringForKey:@"sentinel_synonyms"] ?: @"", ^(NSString *text) {
@@ -1052,7 +1199,8 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
     });
 }
 
-+ (void)onIntervalRow {
++ (void)onIntervalRow:(id)sender {
+    SLog(@"tap: 扫描间隔 → 输入卡片");
     panelPrompt(@"扫描间隔", @"单位秒。越小越灵敏、越费电（建议 1~3）",
         [NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_interval", kIdleInterval)], ^(NSString *text) {
         double d = text.doubleValue;
@@ -1064,7 +1212,8 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
     });
 }
 
-+ (void)onCooldownRow {
++ (void)onCooldownRow:(id)sender {
+    SLog(@"tap: 报警冷却 → 输入卡片");
     panelPrompt(@"报警冷却", @"同一个关键词在这段时间内只报一次（单位秒）",
         [NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_cooldown", kCooldownDefault)], ^(NSString *text) {
         double d = text.doubleValue;
@@ -1243,8 +1392,11 @@ static void selLayout(void) {
                                    MAX(0, S.width - CGRectGetMaxX(r)), r.size.height);
     g_selBox.frame    = r;
     CGFloat hs = 34.0;
-    CGPoint cs[4] = { {r.origin.x, r.origin.y}, {CGRectGetMaxX(r), r.origin.y},
-                      {r.origin.x, CGRectGetMaxY(r)}, {CGRectGetMaxX(r), CGRectGetMaxY(r)} };
+    CGFloat ins = hs / 2.0;   // v2.2：手柄整体收进框内 —— 原来中心钉在框角上，整屏时有一半悬在屏幕外＋贴着系统手势区，手指够不着
+    CGPoint cs[4] = { {r.origin.x + ins, r.origin.y + ins},
+                      {CGRectGetMaxX(r) - ins, r.origin.y + ins},
+                      {r.origin.x + ins, CGRectGetMaxY(r) - ins},
+                      {CGRectGetMaxX(r) - ins, CGRectGetMaxY(r) - ins} };
     for (int i = 0; i < 4; i++) {
         if (!g_handles[i]) continue;
         g_handles[i].bounds = CGRectMake(0, 0, hs, hs);
@@ -1399,7 +1551,7 @@ static void showRegionSelector(void) {
         [w addGestureRecognizer:blank];
 
         UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(0, 40, S.width, 34)];
-        hint.text = @"拖空白处重画 · 拖四角微调 · 拖框内移动";
+        hint.text = @"拖空白重画 · 拖四角缩放 · 拖框内移动（整屏会自动内缩）";
         hint.textAlignment = NSTextAlignmentCenter;
         hint.font = [UIFont systemFontOfSize:13];
         hint.textColor = [UIColor whiteColor];
@@ -1428,6 +1580,13 @@ static void showRegionSelector(void) {
         if (loadRegion(&saved)) {
             r0 = CGRectMake(saved.origin.x * S.width, saved.origin.y * S.height,
                             saved.size.width * S.width, saved.size.height * S.height);
+            // v2.2：保存的是整屏（100%×100%）时，框铺满全屏 → 拖哪儿都是"移动框"且被边界卡死、
+            // 四角手柄又贴在屏幕边缘够不着，用户就"缩不小"。这里自动内缩一圈，一进来就能拖着改小。
+            if (saved.size.width > 0.97 && saved.size.height > 0.97) {
+                CGFloat ix = S.width * 0.08, iy = S.height * 0.10;
+                r0 = CGRectMake(ix, iy, S.width - ix * 2, S.height - iy * 2);
+                SLog(@"saved region was full-screen → preview shrunk for adjustment");
+            }
         }
         g_selRect = r0;
         selLayout();
@@ -1615,6 +1774,6 @@ static void sentinel_init(void) {
         }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ createFloatingBall(); });
-        SLog(@"armed (sentinel v2.1)");
+        SLog(@"armed (sentinel v2.2)");
     });
 }
