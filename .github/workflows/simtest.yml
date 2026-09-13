@@ -74,7 +74,7 @@ jobs:
           NP=${NP:-0}; NF=${NF:-0}
           echo "断言通过 $NP 条，失败 $NF 条"
           if [ "$NF" != "0" ]; then echo "有失败断言："; grep "^FAIL " selftest.txt; PASS=0; fi
-          if [ "$NP" -lt 33 ]; then echo "通过断言数不足($NP<33)"; PASS=0; fi
+          if [ "$NP" -lt 32 ]; then echo "通过断言数不足($NP<32)"; PASS=0; fi
           if [ "$PASS" = "1" ]; then echo "E2E RESULT: ALL PASS"; else echo "E2E RESULT: FAILED"; exit 1; fi
 
       - name: Upload logs

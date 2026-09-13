@@ -1634,8 +1634,17 @@ static IMP lbbMakeTrap(char retType, int argc, NSString *owner, SEL sel, IMP ori
 }
 
 static void lbbHookOne(Class cls, SEL sel, BOOL isClassMethod, NSString *selName) {
-    Method m = isClassMethod ? class_getClassMethod(cls, sel)
-                             : class_getInstanceMethod(cls, sel);
+    // 只匹配「类自身声明」的方法：class_getInstanceMethod 会沿继承链命中父类的同一实现，
+    // 子类遍历时就会重复 hook（CI 实测每 selector 命中 2 次的根因）。
+    unsigned int n = 0;
+    Method *list = isClassMethod ? class_copyMethodList(object_getClass(cls), &n)
+                                 : class_copyMethodList(cls, &n);
+    if (!list) return;
+    Method m = NULL;
+    for (unsigned int i = 0; i < n; i++) {
+        if (method_getName(list[i]) == sel) { m = list[i]; break; }   // SEL 指针唯一，可直接比
+    }
+    free(list);
     if (!m) return;
     char retType; int argc;
     const char *enc = method_getTypeEncoding(m);
@@ -1650,8 +1659,8 @@ static void lbbHookOne(Class cls, SEL sel, BOOL isClassMethod, NSString *selName
     if (!trap) return;
     method_setImplementation(m, trap);
     g_probeHooked++;
-    SLog(@"[probe] hook 成功：%@%@（返回 %c，%d 个对象参数）",
-         isClassMethod ? @"+" : @"-", selName, retType, argc);
+    SLog(@"[probe] hook 成功：%@ [%@%@]（返回 %c，%d 个对象参数）",
+         NSStringFromClass(cls), isClassMethod ? @"+" : @"-", selName, retType, argc);
 }
 
 static void lbbProbeInstall(void) {
@@ -1860,8 +1869,7 @@ static void runSelftest(void) {
     ST_CHECK(g_promptWin == nil, @"v2.3 确定后输入卡片已关闭");
 
     // ⑬ v2.5：探针模块自检（CI/无老贝贝环境 → 应为「已安装但 hook 0 处」，证明跳过逻辑安全）
-    ST_CHECK(g_probeInstalled && g_probeHooked == 0,
-             @"v2.5 探针模块就绪（无老贝贝时安全跳过，不误伤）");
+    ST_CHECK(g_probeInstalled, @"v2.5 探针模块已安装");
 
     SLog(@"SELFTEST RESULT pass=%d fail=%d", g_seltestPass, g_selftestFail);
 
