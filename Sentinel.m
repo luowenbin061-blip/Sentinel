@@ -25,6 +25,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <stdio.h>
+#import <objc/runtime.h>
 
 #pragma mark - 可调参数
 
@@ -936,7 +937,7 @@ static void panelShow(void) {
         // 标题栏：标题左对齐 + 右上白色圆关闭按钮（照截图）
         UIView *titleBar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, kPanelTitleH)];
         [box addSubview:titleBar];
-        UILabel *title = mkLabel(@"屏幕哨兵 v2.4", 17, PANEL_TEXT, YES);   // 带版本号：用户一眼确认注入是否生效
+        UILabel *title = mkLabel(@"屏幕哨兵 v2.5", 17, PANEL_TEXT, YES);   // 带版本号：用户一眼确认注入是否生效
         title.frame = CGRectMake(16, 0, pw - 16 - 52, kPanelTitleH);
         [titleBar addSubview:title];
         UIButton *close = mkCloseButton(32);
@@ -1533,6 +1534,161 @@ static void showRegionSelector(void) {
     }
 }
 
+#pragma mark - 老贝贝识字命中探针（v2.5）
+
+// 用户目标：老贝贝「识字」动作命中关键词时，触发哨兵报警（横幅+卡片+震动/声音）。
+// 第一步是探针：识字命中那一刻老贝贝内部走哪个方法、参数里能不能拿到命中的词，
+// 静态分析定不了，必须真机实测——本模块把候选方法全部挂上「透明日志陷阱」。
+//
+// 设计（零破坏原则）：
+//   · 按候选 selector 遍历全部 ObjC 类（instance/class method 都查），老贝贝类不存在时自然 0 匹配，零影响；
+//   · 只 hook「返回 void/id、参数全为对象且 ≤3 个」的方法 —— block 转发原参数调用原实现，行为不变；
+//   · encoding 不支持的方法只记一条日志，不 hook；
+//   · 识字命中时日志会打出各候选方法的调用时序与参数内容（含 识字命中项 对象的字段）。
+
+static BOOL g_probeInstalled = NO;
+static int  g_probeHooked = 0;
+static int  g_probeSkipped = 0;
+
+static NSString *lbbArgDesc(id o) {
+    if (!o) return @"(nil)";
+    NSString *d = [o description];
+    if (d.length > 120) d = [[d substringToIndex:120] stringByAppendingString:@"…"];
+    return [NSString stringWithFormat:@"<%@> %@", NSStringFromClass([o class] ?: [NSObject class]), d];
+}
+
+// 解析 ObjC 类型编码。返回 1 = 探针支持（返回 v/@，参数全为 @ 且 ≤3 个）
+static int lbbParseEncoding(const char *enc, char *retType, int *argCount) {
+    if (!enc || !*enc) return 0;
+    const char *p = enc;
+    char c = *p++;
+    while (*p >= '0' && *p <= '9') p++;
+    *retType = c;
+    if (c != 'v' && c != '@') return 0;
+    int objs = 0;
+    while (*p) {
+        char t = *p++;
+        while (*p >= '0' && *p <= '9') p++;
+        if (t == ':') continue;              // _cmd
+        if (t != '@') return 0;              // 含非对象参数 → 探针不支持
+        objs++;                              // 第一个是 self
+    }
+    *argCount = objs - 1;
+    return (*argCount >= 0 && *argCount <= 3);
+}
+
+static IMP lbbTrapV0(NSString *owner, SEL sel, IMP orig) {
+    return imp_implementationWithBlock(^(id _self){
+        SLog(@"[probe] %@ > %@ 调用", owner, NSStringFromSelector(sel));
+        ((void(*)(id, SEL))orig)(_self, sel);
+    });
+}
+static IMP lbbTrapV1(NSString *owner, SEL sel, IMP orig) {
+    return imp_implementationWithBlock(^(id _self, id a1){
+        SLog(@"[probe] %@ > %@ 参数1=%@", owner, NSStringFromSelector(sel), lbbArgDesc(a1));
+        ((void(*)(id, SEL, id))orig)(_self, sel, a1);
+    });
+}
+static IMP lbbTrapV2(NSString *owner, SEL sel, IMP orig) {
+    return imp_implementationWithBlock(^(id _self, id a1, id a2){
+        SLog(@"[probe] %@ > %@ 参数1=%@ 参数2=%@", owner, NSStringFromSelector(sel),
+             lbbArgDesc(a1), lbbArgDesc(a2));
+        ((void(*)(id, SEL, id, id))orig)(_self, sel, a1, a2);
+    });
+}
+static IMP lbbTrapV3(NSString *owner, SEL sel, IMP orig) {
+    return imp_implementationWithBlock(^(id _self, id a1, id a2, id a3){
+        SLog(@"[probe] %@ > %@ 参数1=%@ 参数2=%@ 参数3=%@", owner, NSStringFromSelector(sel),
+             lbbArgDesc(a1), lbbArgDesc(a2), lbbArgDesc(a3));
+        ((void(*)(id, SEL, id, id, id))orig)(_self, sel, a1, a2, a3);
+    });
+}
+static IMP lbbTrapR1(NSString *owner, SEL sel, IMP orig) {
+    return imp_implementationWithBlock(^id(id _self, id a1){
+        id r = ((id(*)(id, SEL, id))orig)(_self, sel, a1);
+        SLog(@"[probe] %@ > %@ (返回id) 参数1=%@ 返回=%@", owner, NSStringFromSelector(sel),
+             lbbArgDesc(a1), lbbArgDesc(r));
+        return r;
+    });
+}
+static IMP lbbTrapR2(NSString *owner, SEL sel, IMP orig) {
+    return imp_implementationWithBlock(^id(id _self, id a1, id a2){
+        id r = ((id(*)(id, SEL, id, id))orig)(_self, sel, a1, a2);
+        SLog(@"[probe] %@ > %@ (返回id) 参数1=%@ 参数2=%@ 返回=%@", owner, NSStringFromSelector(sel),
+             lbbArgDesc(a1), lbbArgDesc(a2), lbbArgDesc(r));
+        return r;
+    });
+}
+
+static IMP lbbMakeTrap(char retType, int argc, NSString *owner, SEL sel, IMP orig) {
+    if (retType == 'v') {
+        if (argc == 0) return lbbTrapV0(owner, sel, orig);
+        if (argc == 1) return lbbTrapV1(owner, sel, orig);
+        if (argc == 2) return lbbTrapV2(owner, sel, orig);
+        if (argc == 3) return lbbTrapV3(owner, sel, orig);
+    } else if (retType == '@') {
+        if (argc == 1) return lbbTrapR1(owner, sel, orig);
+        if (argc == 2) return lbbTrapR2(owner, sel, orig);
+    }
+    return NULL;
+}
+
+static void lbbHookOne(Class cls, SEL sel, BOOL isClassMethod, NSString *selName) {
+    Method m = isClassMethod ? class_getClassMethod(cls, sel)
+                             : class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    char retType; int argc;
+    const char *enc = method_getTypeEncoding(m);
+    if (!lbbParseEncoding(enc, &retType, &argc)) {
+        g_probeSkipped++;
+        SLog(@"[probe] %@%@ 存在但 encoding 不支持(%s)，未 hook",
+             isClassMethod ? @"+" : @"-", selName, enc ? enc : "?");
+        return;
+    }
+    IMP orig = method_getImplementation(m);
+    IMP trap = lbbMakeTrap(retType, argc, NSStringFromClass(cls), sel, orig);
+    if (!trap) return;
+    method_setImplementation(m, trap);
+    g_probeHooked++;
+    SLog(@"[probe] hook 成功：%@%@（返回 %c，%d 个对象参数）",
+         isClassMethod ? @"+" : @"-", selName, retType, argc);
+}
+
+static void lbbProbeInstall(void) {
+    if (g_probeInstalled) return;
+    g_probeInstalled = YES;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    BOOL enabled = [ud objectForKey:@"sentinel_lbb_probe"] == nil ? YES : [ud boolForKey:@"sentinel_lbb_probe"];
+    if (!enabled) { SLog(@"[probe] 探针已关闭（sentinel_lbb_probe=NO）"); return; }
+
+    NSArray *cands = @[ @"执行识别成功后点击目标",
+                        @"执行识别成功动作列表",
+                        @"执行识别成功后点击坐标",
+                        @"执行动作",
+                        @"执行一次动作",
+                        @"执行动作列表",
+                        @"开始执行动作列表",
+                        @"执行录制动作",
+                        @"开始预览动作" ];
+
+    int num = objc_getClassList(NULL, 0);
+    if (num <= 0) { SLog(@"[probe] 无法枚举 ObjC 类"); return; }
+    Class *classes = (Class *)malloc(sizeof(Class) * num);
+    if (!classes) return;
+    int real = objc_getClassList(classes, num);
+
+    for (NSString *selName in cands) {
+        SEL sel = NSSelectorFromString(selName);
+        for (int i = 0; i < real; i++) {
+            lbbHookOne(classes[i], sel, NO, selName);
+            lbbHookOne(classes[i], sel, YES, selName);
+        }
+    }
+    free(classes);
+    SLog(@"[probe] 安装完成：hook %d 处，跳过 %d 处（老贝贝未同进程时自然为 0/0）",
+         g_probeHooked, g_probeSkipped);
+}
+
 #pragma mark - 自测（云端模拟器 e2e 用）
 
 // 现场渲染一张假游戏 HUD（不依赖外部图片资源）
@@ -1703,6 +1859,10 @@ static void runSelftest(void) {
     ST_CHECK(wroteKw, @"v2.3 输入卡片「确定」能把参数写进配置");
     ST_CHECK(g_promptWin == nil, @"v2.3 确定后输入卡片已关闭");
 
+    // ⑬ v2.5：探针模块自检（CI/无老贝贝环境 → 应为「已安装但 hook 0 处」，证明跳过逻辑安全）
+    ST_CHECK(g_probeInstalled && g_probeHooked == 0,
+             @"v2.5 探针模块就绪（无老贝贝时安全跳过，不误伤）");
+
     SLog(@"SELFTEST RESULT pass=%d fail=%d", g_seltestPass, g_selftestFail);
 
     NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -1726,6 +1886,7 @@ static void sentinel_init(void) {
     g_lastAlert = [NSMutableDictionary dictionary];
     g_hitStreak = [NSMutableDictionary dictionary];
     refreshConfig();
+    lbbProbeInstall();   // v2.5：识字命中探针（老贝贝类不存在时自动跳过）
 
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     g_selftest = [ud boolForKey:@"sentinel_selftest"];
@@ -1768,6 +1929,6 @@ static void sentinel_init(void) {
         }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ createFloatingBall(); });
-        SLog(@"armed (sentinel v2.4)");
+        SLog(@"armed (sentinel v2.5)");
     });
 }
