@@ -5,7 +5,7 @@
 // 设计要点（2026-09-13 定稿）：
 //   ① 只截框选那一块、只对那一块跑 OCR —— 省一个数量级 CPU，且大幅降低误命中
 //   ② 分级节奏：空闲 2s / 刚命中连验（500ms，连中 2 轮才算）
-//   ③ 关键字匹配四件套：归一化 + 滑窗容错(编辑距离≤1) + 同义词组 + 置信度阈值
+//   ③ 关键字匹配（v2.4）：归一化 + 精确包含 + 置信度阈值；容错与同义词已按用户要求删除（宁漏不误）
 //   ④ 去重冷却：同一关键字 N 秒内只报一次
 //   ⑤ 报警用非阻塞横幅，绝不用 UIAlertController（会抢焦点，影响正在操作的 App）
 //   ⑥ 铃声只用 system sound，不建 AVAudioSession（同进程里可能还有别的插件在用）
@@ -69,18 +69,7 @@ static NSArray<NSString *> *loadKeywords(void) {
 }
 
 // "体力不足=体力不够=没体力;金币不足=金币不够" → @[ @[..], @[..] ]
-static NSArray<NSArray<NSString *> *> *loadSynonyms(void) {
-    NSMutableArray *groups = [NSMutableArray array];
-    for (NSString *grp in splitList([[NSUserDefaults standardUserDefaults] stringForKey:@"sentinel_synonyms"], @";")) {
-        NSMutableArray *g = [NSMutableArray array];
-        for (NSString *w in [grp componentsSeparatedByString:@"="]) {
-            NSString *t = [w stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (t.length) [g addObject:t];
-        }
-        if (g.count) [groups addObject:g];
-    }
-    return groups;
-}
+// v2.4：loadSynonyms 已删除（同义词功能移除）
 
 static double cfgDouble(NSString *key, double def) {
     NSNumber *n = [[NSUserDefaults standardUserDefaults] objectForKey:key];
@@ -162,65 +151,20 @@ static NSString *normalizeText(NSString *s) {
     return out;
 }
 
-static int editDistance(NSString *a, NSString *b) {
-    NSUInteger la = a.length, lb = b.length;
-    if (la == 0) return (int)lb;
-    if (lb == 0) return (int)la;
-    if (la > 64 || lb > 64) return 99;
-    int *p1 = (int *)malloc(sizeof(int) * (lb + 1));
-    int *p2 = (int *)malloc(sizeof(int) * (lb + 1));
-    if (!p1 || !p2) { free(p1); free(p2); return 99; }
-    for (NSUInteger j = 0; j <= lb; j++) p1[j] = (int)j;
-    for (NSUInteger i = 1; i <= la; i++) {
-        p2[0] = (int)i;
-        for (NSUInteger j = 1; j <= lb; j++) {
-            int cost = ([a characterAtIndex:i - 1] == [b characterAtIndex:j - 1]) ? 0 : 1;
-            int v = p1[j - 1] + cost;
-            if (p1[j] + 1 < v) v = p1[j] + 1;
-            if (p2[j - 1] + 1 < v) v = p2[j - 1] + 1;
-            p2[j] = v;
-        }
-        int *t = p1; p1 = p2; p2 = t;
-    }
-    int r = p1[lb];
-    free(p1); free(p2);
-    return r;
-}
+// v2.4：editDistance（编辑距离容错）已删除 —— 改精确匹配
 
+// v2.4：宁漏不误 —— 只做精确包含，删掉编辑距离容错
+// （用户定调：要精确识别，OCR 认错一个字就不认，避免误报）
 static BOOL matchOne(NSString *normText, NSString *normKw) {
     if (!normText.length || !normKw.length) return NO;
-    if ([normText containsString:normKw]) return YES;
-    if (normKw.length < 2) return NO;
-    if (normText.length < normKw.length) return NO;
-    NSUInteger L = normKw.length;
-    for (NSUInteger i = 0; i + L <= normText.length; i++) {
-        NSString *sub = [normText substringWithRange:NSMakeRange(i, L)];
-        if (editDistance(sub, normKw) <= 1) return YES;
-    }
-    return NO;
+    return [normText containsString:normKw];
 }
 
 // 一行文字是否命中；命中返回"报告用的关键词原文"，没命中返回 nil
-static NSString *matchLine(NSString *normText, NSArray<NSString *> *keywords,
-                           NSArray<NSArray<NSString *> *> *synonymGroups) {
-    // ① 直接关键词
+// v2.4：删掉同义词组 —— 用户判断完全没用（要精确识别，同义词表要人维护、鸡肋）
+static NSString *matchLine(NSString *normText, NSArray<NSString *> *keywords) {
     for (NSString *kw in keywords) {
         if (matchOne(normText, normalizeText(kw))) return kw;
-    }
-    // ② 同义词组：组里只要有用户配的关键词，就看该组其它词是否命中
-    for (NSArray<NSString *> *grp in synonymGroups) {
-        BOOL groupWanted = NO;
-        NSString *groupKey = nil;
-        for (NSString *g in grp) {
-            for (NSString *kw in keywords) {
-                if ([normalizeText(kw) isEqualToString:normalizeText(g)]) { groupWanted = YES; groupKey = kw; break; }
-            }
-            if (groupWanted) break;
-        }
-        if (!groupWanted) continue;
-        for (NSString *g in grp) {
-            if (matchOne(normText, normalizeText(g))) return groupKey;
-        }
     }
     return nil;
 }
@@ -233,7 +177,6 @@ static BOOL   g_running = NO;
 static BOOL   g_selecting = NO;
 static BOOL   g_selftest = NO;
 static NSArray<NSString *> *g_keywords = nil;
-static NSArray<NSArray<NSString *> *> *g_synonyms = nil;
 static NSMutableDictionary *g_lastAlert = nil;
 static NSMutableDictionary *g_hitStreak = nil;
 static NSString *g_lastReport = @"(还没有记录)";
@@ -259,7 +202,6 @@ static void runSelftest(void);
 
 static void refreshConfig(void) {
     g_keywords = loadKeywords();
-    g_synonyms = loadSynonyms();
 }
 
 #pragma mark - 截屏 + 裁剪
@@ -567,7 +509,7 @@ static void evaluate(UIImage *crop, NSMutableArray *outHits, NSMutableArray *out
         for (NSArray *it in items) {
             NSString *norm = it[0], *raw = it[1];
             [outTexts addObject:raw];
-            NSString *k = matchLine(norm, g_keywords, g_synonyms);
+            NSString *k = matchLine(norm, g_keywords);
             if (k) [outHits addObject:k];
         }
     });
@@ -591,15 +533,26 @@ static void scanOnce(NSString *reason) {
         return;
     }
 
+    // v2.4：耗时拆解日志 —— 用户要"毫秒级"，先拿真机数字说话，别拍脑袋调参
+    NSTimeInterval t0 = CACurrentMediaTime();
     UIImage *full = captureScreen();
+    NSTimeInterval t1 = CACurrentMediaTime();
     if (!full) { SLog(@"scan(%@) capture failed", reason); return; }
     UIImage *crop = cropToRegion(full, norm);
+    NSTimeInterval t2 = CACurrentMediaTime();
     if (!crop) { SLog(@"scan(%@) crop failed", reason); return; }
 
     NSMutableArray *hits = [NSMutableArray array];
     NSMutableArray *texts = [NSMutableArray array];
     evaluate(crop, hits, texts);
+    NSTimeInterval t3 = CACurrentMediaTime();
     g_lastScanTexts = [texts copy];
+
+    size_t pw = crop.CGImage ? CGImageGetWidth(crop.CGImage) : 0;
+    size_t ph = crop.CGImage ? CGImageGetHeight(crop.CGImage) : 0;
+    SLog(@"timing(%@): 截屏 %.0fms | 裁剪 %.0fms | OCR+匹配 %.0fms | 单轮合计 %.0fms | 送检图 %.0fx%.0f 像素(%.1f万) | 文字 %lu 条",
+         reason, (t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - t2) * 1000, (t3 - t0) * 1000,
+         (double)pw, (double)ph, pw * ph / 10000.0, (unsigned long)texts.count);
 
     SLog(@"scan(%@) crop=%.0fx%.0f texts=%lu hits=%@", reason,
          crop.size.width, crop.size.height, (unsigned long)texts.count,
@@ -701,7 +654,7 @@ static UIWindow *g_panelWin = nil;
 static UIView   *g_panelBox = nil;
 static UIScrollView *g_panelScroll = nil;
 static UILabel  *g_panelStatus = nil;
-static UILabel  *g_regionValue = nil, *g_kwValue = nil, *g_synValue = nil;
+static UILabel  *g_regionValue = nil, *g_kwValue = nil;
 static UILabel  *g_intervalVal = nil, *g_cooldownVal = nil;
 static UISegmentedControl *g_vibSeg = nil, *g_sndSeg = nil;
 static UIButton *g_runBtn = nil;
@@ -879,12 +832,7 @@ static void panelBuild(void) {
     g_kwValue = (UILabel *)[r3 viewWithTag:kValueTag];
     panelAdd(0, r3, w);
 
-    // ④ 同义词
-    panelAddSectionTitle(@"同义词", w);
-    NSString *syn = [ud stringForKey:@"sentinel_synonyms"];
-    UIButton *r4 = mkRowField(syn.length ? syn : @"点击设置", w, @selector(onSynonymsRow:));
-    g_synValue = (UILabel *)[r4 viewWithTag:kValueTag];
-    panelAdd(0, r4, w);
+    // v2.4：删掉「同义词」区（用户判断没用，要精确识别）
 
     // ⑤ 节奏
     panelAddSectionTitle(@"扫描间隔（秒）", w);
@@ -926,8 +874,6 @@ static void panelRefreshStatus(void) {
     g_panelStatus.text = st;
     if (g_regionValue) g_regionValue.text = regionText();
     if (g_kwValue)     g_kwValue.text = [g_keywords componentsJoinedByString:@","];
-    NSString *syn = [ud stringForKey:@"sentinel_synonyms"];
-    if (g_synValue)    g_synValue.text = syn.length ? syn : @"点击设置";
     if (g_intervalVal) g_intervalVal.text = [NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_interval", kIdleInterval)];
     if (g_cooldownVal) g_cooldownVal.text = [NSString stringWithFormat:@"%.1f", cfgDouble(@"sentinel_cooldown", kCooldownDefault)];
     if (g_runBtn)      [g_runBtn setTitle:(g_running ? @"暂停监视" : @"开始监视") forState:UIControlStateNormal];
@@ -940,7 +886,7 @@ static void panelHide(void) {
     if (!g_panelWin) return;
     UIWindow *w = g_panelWin;
     g_panelWin = nil; g_panelBox = nil; g_panelScroll = nil; g_panelStatus = nil;
-    g_regionValue = g_kwValue = g_synValue = g_intervalVal = g_cooldownVal = nil;
+    g_regionValue = g_kwValue = g_intervalVal = g_cooldownVal = nil;
     g_vibSeg = g_sndSeg = nil; g_runBtn = nil;
     [UIView animateWithDuration:0.16 animations:^{ w.alpha = 0; }
                      completion:^(BOOL f) { w.hidden = YES; SLog(@"panel closed"); }];
@@ -990,7 +936,7 @@ static void panelShow(void) {
         // 标题栏：标题左对齐 + 右上白色圆关闭按钮（照截图）
         UIView *titleBar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, kPanelTitleH)];
         [box addSubview:titleBar];
-        UILabel *title = mkLabel(@"屏幕哨兵 v2.3", 17, PANEL_TEXT, YES);   // 带版本号：用户一眼确认注入是否生效
+        UILabel *title = mkLabel(@"屏幕哨兵 v2.4", 17, PANEL_TEXT, YES);   // 带版本号：用户一眼确认注入是否生效
         title.frame = CGRectMake(16, 0, pw - 16 - 52, kPanelTitleH);
         [titleBar addSubview:title];
         UIButton *close = mkCloseButton(32);
@@ -1187,18 +1133,7 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
     });
 }
 
-+ (void)onSynonymsRow:(id)sender {
-    SLog(@"tap: 同义词 → 输入卡片");
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    panelPrompt(@"同义词", @"同义词用 = 连，不同组用 ; 隔。例：体力不足=体力不够;金币不足=金币不够",
-                [ud stringForKey:@"sentinel_synonyms"] ?: @"", ^(NSString *text) {
-        [[NSUserDefaults standardUserDefaults] setObject:(text ?: @"") forKey:@"sentinel_synonyms"];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        refreshConfig();
-        SLog(@"synonyms → %@", text);
-        panelRefreshStatus();
-    });
-}
+// v2.4：onSynonymsRow 已删除（同义词功能移除）
 
 + (void)onIntervalRow:(id)sender {
     SLog(@"tap: 扫描间隔 → 输入卡片");
@@ -1641,17 +1576,32 @@ static void runSelftest(void) {
     ST_CHECK(matchOne(@"体力不足无法继续", @"体力不足"), @"match 子串命中");
     ST_CHECK(!matchOne(@"金币不足", @"体力不足"), @"match 不误命中");
 
-    // ③ 容错（OCR 错认一个字）
-    ST_CHECK(matchOne(@"体力木足无法继续", @"体力不足"), @"match 容错(编辑距离1)");
-    ST_CHECK(!matchOne(@"体力没有问题", @"体力不足"), @"match 容错不过度放宽");
+    // ③ v2.4：宁漏不误 —— 容错已删除，OCR 认错一个字就不该命中
+    ST_CHECK(!matchOne(@"体力木足无法继续", @"体力不足"), @"v2.4 精确匹配：错字不再命中");
+    ST_CHECK(!matchOne(@"体力没有问题", @"体力不足"), @"v2.4 精确匹配：不相干的词不命中");
 
-    // ④ 同义词组（用"没劲了"这种和关键词差很多的词，才能单独验证同义词这条路）
-    NSArray *grpSyn = @[ @[@"体力不足", @"没劲了"] ];
-    ST_CHECK([matchLine(@"没劲了", @[@"体力不足"], grpSyn) isEqualToString:@"体力不足"],
-              @"synonym 组内其它词命中并回报组键");
-    ST_CHECK(matchLine(@"金币不足", @[@"体力不足"], grpSyn) == nil, @"synonym 组外不命中");
-    ST_CHECK([matchLine(@"体力木足", @[@"体力不足"], @[]) isEqualToString:@"体力不足"],
-              @"match 容错命中并回报关键词");
+    // ④ v2.4：同义词功能已删除 —— 别的说法不再命中（要报就自己加进关键词）
+    ST_CHECK([matchLine(@"体力不足", @[@"体力不足"]) isEqualToString:@"体力不足"],
+              @"v2.4 精确匹配：正常命中并回报关键词");
+    ST_CHECK(matchLine(@"没劲了", @[@"体力不足"]) == nil, @"v2.4 已删同义词：别的说法不命中");
+    ST_CHECK(matchLine(@"金币不足", @[@"体力不足"]) == nil, @"v2.4 无关词不命中");
+
+    // ⑤ v2.4：耗时测量链（真机靠这条日志定"毫秒级"能到什么程度）
+    {
+        NSTimeInterval q0 = CACurrentMediaTime();
+        UIImage *hud0 = renderFakeHUD();
+        UIImage *band0 = cropToRegion(hud0, CGRectMake(0, kSelftestBandY, 1, kSelftestBandH));
+        NSTimeInterval q1 = CACurrentMediaTime();
+        __block NSUInteger n0 = 0;
+        runOCR(band0, ^(NSArray *items) { n0 = items.count; });
+        NSTimeInterval q2 = CACurrentMediaTime();
+        size_t w0 = band0.CGImage ? CGImageGetWidth(band0.CGImage) : 0;
+        size_t h0 = band0.CGImage ? CGImageGetHeight(band0.CGImage) : 0;
+        SLog(@"timing(selftest): 造图+裁剪 %.0fms | OCR %.0fms | 合计 %.0fms | 送检图 %.0fx%.0f 像素(%.1f万) | 文字 %lu 条",
+             (q1 - q0) * 1000, (q2 - q1) * 1000, (q2 - q0) * 1000,
+             (double)w0, (double)h0, w0 * h0 / 10000.0, (unsigned long)n0);
+        ST_CHECK(q2 > q0 && n0 >= 1, @"v2.4 耗时测量链可用（日志里能看到 timing）");
+    }
 
     // ⑤ 区域裁剪（不依赖 OCR）
     UIImage *hud = renderFakeHUD();
@@ -1673,7 +1623,6 @@ static void runSelftest(void) {
 
         // ⑦ 关键字真的能命中（完整链：裁区域 → OCR → 归一化 → 匹配）
         g_keywords = @[@"体力不足"];
-        g_synonyms = @[ @[@"体力不足", @"体力不够"] ];
         __block int hits = 0;
         __block NSString *seen = @"(空)";
         NSMutableArray *hh = [NSMutableArray array], *tt = [NSMutableArray array];
@@ -1693,7 +1642,6 @@ static void runSelftest(void) {
 
     // ⑨ 配置
     g_keywords = loadKeywords();
-    g_synonyms = loadSynonyms();
     ST_CHECK(g_keywords.count >= 1, @"config 关键词加载非空");
     saveRegion(CGRectMake(0.1, 0.2, 0.3, 0.4));
     CGRect rr;
@@ -1820,6 +1768,6 @@ static void sentinel_init(void) {
         }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ createFloatingBall(); });
-        SLog(@"armed (sentinel v2.3)");
+        SLog(@"armed (sentinel v2.4)");
     });
 }
