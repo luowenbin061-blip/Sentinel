@@ -65,7 +65,7 @@ jobs:
       - name: Verdict
         run: |
           PASS=1
-          for m in "armed (sentinel v2" "floating ball created" "selftest begin" "panel shown" "alert card shown"; do
+          for m in "armed (sentinel v2" "floating ball created" "selftest begin" "panel shown" "alert card shown" "prompt shown"; do
             if grep -q "$m" sentinel.log; then echo "PASS: $m"; else echo "FAIL: $m"; PASS=0; fi
           done
           # 注意：grep -c 命中 0 条时退出码是 1，不能再 || echo 0，否则会多出一行导致整数比较失败
@@ -74,7 +74,7 @@ jobs:
           NP=${NP:-0}; NF=${NF:-0}
           echo "断言通过 $NP 条，失败 $NF 条"
           if [ "$NF" != "0" ]; then echo "有失败断言："; grep "^FAIL " selftest.txt; PASS=0; fi
-          if [ "$NP" -lt 24 ]; then echo "通过断言数不足($NP<24)"; PASS=0; fi
+          if [ "$NP" -lt 30 ]; then echo "通过断言数不足($NP<30)"; PASS=0; fi
           if [ "$PASS" = "1" ]; then echo "E2E RESULT: ALL PASS"; else echo "E2E RESULT: FAILED"; exit 1; fi
 
       - name: Upload logs

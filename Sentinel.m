@@ -33,13 +33,11 @@ static const double kIdleInterval           = 2.0;   // 空闲扫描间隔(秒)
 static const double kVerifyInterval         = 0.5;   // 命中后连验间隔(秒)
 static const int    kVerifyNeed             = 2;     // 连续 N 轮命中才报警（防误报）
 static const double kCooldownDefault        = 10.0;  // 同一关键字冷却(秒)
-static const double kBusyInterval           = 6.0;   // 别人在忙时的降频间隔(秒)
-static const double kBusyHold               = 8.0;   // 收到执行通知后降频保持(秒)
 static const CGFloat kMinRegionSide         = 24.0;  // 框选最小边长(pt)
 static const double kSelftestBandY          = 0.44;  // 自测假图里文字所在条带(归一化)
 static const double kSelftestBandH          = 0.14;
 
-static NSString *const kPeerBusyNote = @"com.changqing.fullTaskExecution";
+// v2.3：删掉"与老贝贝共存"整套（入口挂载开关 + 收到对端通知降频）——用户确认不需要
 
 // 面板配色（v2.2：上移到文件前部 —— 报警卡片在面板工厂之前定义，要用这几个宏）
 #define PANEL_BG      [UIColor colorWithRed:0.173 green:0.173 blue:0.180 alpha:0.95]  // #2C2C2E
@@ -234,7 +232,6 @@ static BOOL   g_armed = NO;
 static BOOL   g_running = NO;
 static BOOL   g_selecting = NO;
 static BOOL   g_selftest = NO;
-static double g_busyUntil = 0;
 static NSArray<NSString *> *g_keywords = nil;
 static NSArray<NSArray<NSString *> *> *g_synonyms = nil;
 static NSMutableDictionary *g_lastAlert = nil;
@@ -637,7 +634,6 @@ static void scanOnce(NSString *reason) {
 static void scheduleNextScan(void) {
     if (!g_running) return;
     double iv = cfgDouble(@"sentinel_interval", kIdleInterval);
-    if (CACurrentMediaTime() < g_busyUntil && iv < kBusyInterval) iv = kBusyInterval;
     BOOL verifying = NO;
     for (NSNumber *n in g_hitStreak.allValues) if (n.intValue > 0) { verifying = YES; break; }
     if (verifying && iv > kVerifyInterval) iv = kVerifyInterval;
@@ -677,6 +673,10 @@ static void probeOnce(void) {
 #pragma mark - 面板（仿老贝贝「设置弹窗」结构，纯 frame 布局）
 // 面板所有控件的动作都派发到这里（必须先声明，控件工厂里要用 [SELActions class]）
 @interface SELActions : NSObject
+// v2.3：自测里要直接调这几个做云端回归断言，先声明避免 -Wall 告警
++ (void)onKeywordsRow:(id)sender;
++ (void)onPromptOK;
++ (void)onPromptCancel;
 @end
 // 结构照它的 ivar 1:1 还原：
 //   遮罩 → 面板(标题栏=标题标签+标题高光层CAGradientLayer+关闭按钮)
@@ -695,7 +695,7 @@ static const CGFloat kGapSection  = 18.0;   // 上一控件 → 下个字段标�
 static const CGFloat kSegH        = 36.0;
 static const CGFloat kPanelWidthRatio = 0.66;  // 面板宽 = 屏宽 × 0.66（截图量出来的）
 
-// 面板配色宏已上移到文件前部（kPeerBusyNote 之后）——报警卡片先于面板工厂定义，要用它们
+// 面板配色宏已上移到文件前部 —— 报警卡片先于面板工厂定义，要用它们
 
 static UIWindow *g_panelWin = nil;
 static UIView   *g_panelBox = nil;
@@ -703,7 +703,7 @@ static UIScrollView *g_panelScroll = nil;
 static UILabel  *g_panelStatus = nil;
 static UILabel  *g_regionValue = nil, *g_kwValue = nil, *g_synValue = nil;
 static UILabel  *g_intervalVal = nil, *g_cooldownVal = nil;
-static UISegmentedControl *g_vibSeg = nil, *g_sndSeg = nil, *g_hookSeg = nil;
+static UISegmentedControl *g_vibSeg = nil, *g_sndSeg = nil;
 static UIButton *g_runBtn = nil;
 static NSInteger g_sectionCount = 0;
 static CGFloat   g_panelW = 0;
@@ -910,15 +910,7 @@ static void panelBuild(void) {
        forControlEvents:UIControlEventValueChanged];
     panelAdd(0, g_sndSeg, w);
 
-    // ⑦ 与老贝贝共存
-    panelAddSectionTitle(@"入口挂到老贝贝设置页", w);
-    g_hookSeg = mkSegmented(@[ @"不挂", @"挂上" ], [ud boolForKey:@"sentinel_hook_settings"] ? 1 : 0, w, 402);
-    [g_hookSeg addTarget:[SELActions class] action:@selector(onHookSeg:)
-        forControlEvents:UIControlEventValueChanged];
-    panelAdd(0, g_hookSeg, w);
-    UILabel *note = mkLabel(@"默认不挂 —— 不会改动老贝贝本身。", 12, PANEL_DIM, NO);
-    note.frame = CGRectMake(0, 0, w, 16);
-    panelAdd(6, note, w);
+    // v2.3：删掉「入口挂到老贝贝设置页」（原为占位开关，未实现任何功能，用户确认不需要）
 
     g_panelScroll.contentSize = CGSizeMake(w, g_cursorY + 14);
     panelRefreshStatus();
@@ -949,7 +941,7 @@ static void panelHide(void) {
     UIWindow *w = g_panelWin;
     g_panelWin = nil; g_panelBox = nil; g_panelScroll = nil; g_panelStatus = nil;
     g_regionValue = g_kwValue = g_synValue = g_intervalVal = g_cooldownVal = nil;
-    g_vibSeg = g_sndSeg = g_hookSeg = nil; g_runBtn = nil;
+    g_vibSeg = g_sndSeg = nil; g_runBtn = nil;
     [UIView animateWithDuration:0.16 animations:^{ w.alpha = 0; }
                      completion:^(BOOL f) { w.hidden = YES; SLog(@"panel closed"); }];
 }
@@ -998,7 +990,7 @@ static void panelShow(void) {
         // 标题栏：标题左对齐 + 右上白色圆关闭按钮（照截图）
         UIView *titleBar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, kPanelTitleH)];
         [box addSubview:titleBar];
-        UILabel *title = mkLabel(@"屏幕哨兵", 17, PANEL_TEXT, YES);
+        UILabel *title = mkLabel(@"屏幕哨兵 v2.3", 17, PANEL_TEXT, YES);   // 带版本号：用户一眼确认注入是否生效
         title.frame = CGRectMake(16, 0, pw - 16 - 52, kPanelTitleH);
         [titleBar addSubview:title];
         UIButton *close = mkCloseButton(32);
@@ -1058,7 +1050,7 @@ static void panelShow(void) {
 
 static void panelPrompt(NSString *title, NSString *hint, NSString *current,
                         void (^onOK)(NSString *text)) {
-    dispatch_async(dispatch_get_main_queue(), ^{
+    void (^blk)(void) = ^{
         @try {
             if (g_promptWin) { g_promptWin.hidden = YES; g_promptWin = nil; }
             UIWindowScene *scene = nil;
@@ -1078,9 +1070,10 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
             w.userInteractionEnabled = YES;
             g_promptWin = w;
 
-            UIView *tap = [[UIView alloc] initWithFrame:w.bounds];
-            [tap addGestureRecognizer:[[UITapGestureRecognizer alloc]
-                initWithTarget:[SELActions class] action:@selector(onPromptCancel)]];
+            // v2.3：点卡片外面 = 取消。改用 UIControl（手势在这套悬浮窗里不触发）
+            UIControl *tap = [[UIControl alloc] initWithFrame:w.bounds];
+            [tap addTarget:[SELActions class] action:@selector(onPromptCancel)
+          forControlEvents:UIControlEventTouchUpInside];
             [w addSubview:tap];
 
             // 卡片规格照截图：圆角 18 / #2C2C2E / 标题左对齐 / 右上白色圆关闭
@@ -1141,10 +1134,18 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
             [card addSubview:ok];
 
             g_promptOK = onOK;
-            [tf becomeFirstResponder];
-            SLog(@"prompt shown: %@", title);
+            // ★ v2.3 关键修复（真机"点了没反应"的真凶）：
+            //   ① UIWindow 创建后默认 hidden=YES —— 原来只建不显示，卡片根本看不见
+            //   ② 不是 key window 时 becomeFirstResponder 会失败 —— 输入法自然也不弹
+            [w makeKeyAndVisible];
+            BOOL focused = [tf becomeFirstResponder];
+            SLog(@"prompt shown: %@ (hidden=%d key=%d focus=%d)", title,
+                 (int)w.hidden, (int)w.isKeyWindow, (int)focused);
         } @catch (NSException *e) { SLog(@"prompt exception: %@", e); }
-    });
+    };
+    // 已在主线程就直接执行（同步，方便云端自测断言），否则派发到主线程
+    if ([NSThread isMainThread]) blk();
+    else dispatch_async(dispatch_get_main_queue(), blk);
 }
 #pragma mark 面板动作（全部由面板控件派发到这里）
 
@@ -1237,13 +1238,6 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
     SLog(@"sound → %d", (int)(s.selectedSegmentIndex == 1));
 }
 
-+ (void)onHookSeg:(UISegmentedControl *)s {
-    BOOL on = (s.selectedSegmentIndex == 1);
-    [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"sentinel_hook_settings"];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    SLog(@"hook settings page → %d（需重开 App；本次运行不生效）", (int)on);
-}
-
 + (void)onFootBtn:(UIButton *)b {
     if (b.tag == 301) {
         if (g_running) stopWatching(); else startWatching();
@@ -1264,7 +1258,12 @@ static void panelPrompt(NSString *title, NSString *hint, NSString *current,
 }
 
 + (void)onPromptCancel {
-    if (g_promptWin) { g_promptWin.hidden = YES; g_promptWin = nil; g_promptCard = nil; g_promptField = nil; g_promptOK = nil; }
+    if (g_promptWin) {
+        g_promptWin.hidden = YES;
+        g_promptWin = nil; g_promptCard = nil; g_promptField = nil; g_promptOK = nil;
+        // v2.3：把 key 还给面板窗口（输入卡片是临时抢 key 的）
+        if (g_panelWin) [g_panelWin makeKeyWindow];
+    }
 }
 
 + (void)onPromptOK {
@@ -1738,6 +1737,24 @@ static void runSelftest(void) {
     // ④ 报警卡片：异步建窗，靠日志断言（simtest Verdict 里 grep "alert card shown"）
     fireAlert(@"福利", @"福利 点击领取");
 
+    // ⑪ v2.3 回归：输入卡片必须"真的显示出来 + 拿到键盘焦点"
+    //    真机"点四行没反应"的真凶：窗口建了但没显示（UIWindow 默认 hidden=YES），
+    //    且非 key window 时 becomeFirstResponder 失败 → 卡片看不见、键盘也不弹
+    [SELActions onKeywordsRow:nil];
+    BOOL cardShown  = (g_promptWin != nil && !g_promptWin.hidden);
+    BOOL cardIsKey  = (g_promptWin != nil && g_promptWin.isKeyWindow);
+    BOOL fieldFocus = (g_promptField != nil && [g_promptField isFirstResponder]);
+    ST_CHECK(cardShown,  @"v2.3 输入卡片真的显示出来了（不是 hidden）");
+    ST_CHECK(cardIsKey,  @"v2.3 输入卡片窗口成为 key（键盘能弹）");
+    ST_CHECK(fieldFocus, @"v2.3 输入框自动获得焦点");
+    // 确定按钮回填也验一次，顺带确认关闭把 key 还给了面板
+    if (g_promptField) g_promptField.text = @"福利,测试词";
+    [SELActions onPromptOK];
+    BOOL wroteKw = [[[NSUserDefaults standardUserDefaults] stringForKey:@"sentinel_keywords"]
+                    rangeOfString:@"测试词"].location != NSNotFound;
+    ST_CHECK(wroteKw, @"v2.3 输入卡片「确定」能把参数写进配置");
+    ST_CHECK(g_promptWin == nil, @"v2.3 确定后输入卡片已关闭");
+
     SLog(@"SELFTEST RESULT pass=%d fail=%d", g_seltestPass, g_selftestFail);
 
     NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -1775,13 +1792,6 @@ static void sentinel_init(void) {
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kStartupDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        // 同进程别的插件执行任务时降频，避开点击时序冲突
-        [[NSNotificationCenter defaultCenter] addObserverForName:kPeerBusyNote
-            object:nil queue:nil usingBlock:^(NSNotification *note) {
-                g_busyUntil = CACurrentMediaTime() + kBusyHold;
-                SLog(@"peer busy note → throttle %.0fs", kBusyHold);
-        }];
-
         void (^onActive)(void) = ^{
             @try {
                 createFloatingBall();
@@ -1810,6 +1820,6 @@ static void sentinel_init(void) {
         }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ createFloatingBall(); });
-        SLog(@"armed (sentinel v2.2)");
+        SLog(@"armed (sentinel v2.3)");
     });
 }
